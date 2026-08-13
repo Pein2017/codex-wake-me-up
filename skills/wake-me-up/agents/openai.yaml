@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wake Me Up"
+  short_description: "Arm guarded monitor instead of waiting"
+  default_prompt: "For my current long same-host job, defer the active goal and arm one guarded wake-up monitor."

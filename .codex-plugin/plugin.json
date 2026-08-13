@@ -1,0 +1,26 @@
+{
+  "name": "codex-wake-me-up",
+  "version": "0.1.0+codex.20260808174817",
+  "description": "Host-local durable monitors for guarded Codex goal continuation.",
+  "author": {
+    "name": "CoordExp"
+  },
+  "interface": {
+    "displayName": "Codex Wake Me Up",
+    "shortDescription": "Guarded local defer and wake-up monitors for Codex goals.",
+    "longDescription": "Arms a typed host-local monitor and conservatively defers or continues one guarded Codex goal when its condition is met.",
+    "developerName": "CoordExp",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "For a long same-host job, conservatively defer my active goal and arm one guarded wake-up monitor."
+    ],
+    "composerIcon": "./assets/wake-me-up-icon.png",
+    "logo": "./assets/wake-me-up-icon.png"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

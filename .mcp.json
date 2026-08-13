@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "codex_wake_me_up": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["./scripts/mcp_server.py"],
+      "cwd": ".",
+      "required": false,
+      "supports_parallel_tool_calls": false,
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 30
+    }
+  }
+}
