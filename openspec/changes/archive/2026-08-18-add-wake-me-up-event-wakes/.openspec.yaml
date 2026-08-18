@@ -1,0 +1,6 @@
+schema: spec-driven
+created: 2026-08-18
+goal: Close the wait-token gaps against the Claude Code monitor-event contract
+  with deferred terminal wakes, event-carrying log and subagent-idle
+  conditions, a wake report, and re-arm lineage, without weakening the
+  one-activation guarantee.

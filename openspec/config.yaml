@@ -1,0 +1,79 @@
+schema: spec-driven
+
+context: |
+  codex-wake-me-up is a source-owned Codex plugin: a host-local, durable,
+  one-shot monitor that waits for a typed external condition and then makes at
+  most one guarded continuation request against one exact Codex goal.
+
+  Authority order for this module:
+  - openspec/specs/ owns the normative behavior contract.
+  - openspec/changes/archive/ is history and forensic evidence, never current
+    authority. Archived verification records (receipts, state-machine diffs)
+    are read-only accounts of what was true when they were written.
+  - src/codex_wake_me_up/ is the implementation; skills/wake-me-up/SKILL.md is
+    the packaged agent-facing guidance; README.md is the operator surface.
+  - The parent repository's openspec root owns CoordExp-Swift and is unrelated
+    to this module.
+
+  Standing invariants. A change must preserve these or explicitly renegotiate
+  them in its proposal:
+  - At most one durable trigger claim and at most one activation request per
+    monitor, regardless of what caused the wake.
+  - Continuation is the native guarded goal-status write only. No `turn/start`,
+    no `thread/resume`, no synthetic user messages, no second activation path.
+  - Conditions are a typed AST evaluated by read-only observers. No raw shell
+    predicates, and the daemon writes nothing outside its runtime root.
+  - Host-local only: no TCP listener, no remote target, no cross-host state.
+  - A successful receipt is the only authoritative task-success evidence. Time,
+    GPU utilization, PID exit, tmux exit, log content, and thread idleness are
+    heuristic, and continuing a goal from them requires an explicit opt-in.
+  - Fail closed on uncertainty. Guard violation, mis-targeting, an uncertain
+    write, and cancellation are terminal, and are never compensated or retried.
+  - Legacy (non-deferred) monitor behavior is preserved. Deferred monitors add
+    durable wake reasons; they add no new state-machine phase.
+
+  Local control-plane facts established by execution on 2026-08-18, not by
+  assumption. They cost real model spend to learn; do not re-derive them:
+  - An `active` goal on this host is a work order. The Codex Desktop goal
+    runtime picks up an active goal on an idle thread and starts a real, billed
+    turn to pursue it. Fixtures must create goals `paused`, or use inert
+    objective text, or budget the induced turns.
+  - Every activation path requires the target thread to be observed `idle`.
+    A thread parked in a non-idle state such as `systemError` never opens the
+    idle barrier, so the "woken at the latest at expiry" guarantee carries a
+    third precondition beyond a live daemon and a matching guard: the target
+    must reach `idle` at least once after expiry.
+  - `goal.status` includes `blocked` alongside `active` and `paused`. Current
+    behavior fails closed on it, but it is part of the real vocabulary.
+  - The plugin runs from an installed cache under
+    `$CODEX_HOME/plugins/cache/`, and its daemon holds a lock keyed to the
+    runtime root. After any install or rollback, re-read the lock-holding
+    daemon's `/proc` cmdline and `PYTHONPATH` and restart it; otherwise the
+    previous version's daemon keeps serving new monitors.
+
+rules:
+  proposal:
+    - State the operator-visible problem, the intended contract change, scope,
+      non-goals, and which standing invariant the change touches.
+    - Name user-owned decisions explicitly: material cost, irreversible local
+      behavior, and any weakening of the one-activation or fail-closed rules.
+  specs:
+    - Encode only verifiable behavior as capability-named specs with concrete
+      scenarios; do not write normative deltas for internal refactors.
+    - A MODIFIED requirement must carry the complete replacement scenario set,
+      including every scenario it intends to keep. Archive-time spec sync
+      rejects a block that would silently drop one.
+    - Distinguish evidence classes in scenario text: receipt success is
+      authoritative, everything else is heuristic.
+  design:
+    - Enumerate every site that writes a terminal state and classify each as
+      wake-eligible, retryable, or justified fail-closed. Error paths, not the
+      happy path, are where stranding re-enters.
+    - Name the observable receipt for each behavior: which durable field, which
+      terminal outcome, which test.
+  tasks:
+    - Pair every error-path disposition with its own regression test.
+    - Verify against the real local app-server before claiming a behavior
+      works end to end; a passing unit test is not execution evidence. Record
+      what was blocked rather than substituting a fake.
+    - Diff failure sets against a recorded baseline; never compare pass counts.

@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-08-08
+goal: Allow a Codex agent to arm a host-local watcher, pause an active goal, end
+  its turn, and later continue only through the existing guarded one-shot
+  activation path.
