@@ -1,6 +1,6 @@
 {
   "name": "codex-wake-me-up",
-  "version": "0.1.0+codex.20260818080356",
+  "version": "0.1.0+codex.20260818092924",
   "description": "Host-local durable monitors for guarded Codex goal continuation.",
   "author": {
     "name": "CoordExp"

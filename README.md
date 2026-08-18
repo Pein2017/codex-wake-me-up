@@ -271,7 +271,16 @@ its daemon holds a lock keyed to the runtime root. **After any install or
 rollback, re-read the lock-holding daemon's `/proc` cmdline and `PYTHONPATH`,
 then restart it.** A surviving daemon from the previous version keeps serving
 new monitors with old code, which silently produces old behavior under a new
-version label.
+version label — and because a reinstall replaces the previous cache directory,
+that daemon ends up executing from a path that no longer exists.
+
+The installer copies the source tree **verbatim**: it honours neither
+`.gitignore` nor `.codexignore` (verified 2026-08-18 on Codex Desktop 0.147.0),
+so `openspec/`, `tests/`, `.serena/`, and Python caches all ship, about 2.9 MB
+in total. This is inert rather than harmful — an installed plugin reads only
+what its manifest declares, `skills/` and `.mcp.json` — but do not expect an
+ignore file to shrink the package. `.codexignore` records the intended
+exclusions in case the installer gains support.
 
 Reverting the cachebuster string alone is not a code rollback: the marketplace
 installs from the source tree, so a rollback is (1) restore the source to the

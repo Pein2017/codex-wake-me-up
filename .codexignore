@@ -1,0 +1,25 @@
+# Declared packaging exclusions for the installable plugin.
+#
+# STATUS (verified 2026-08-18, Codex Desktop 0.147.0): this file is currently
+# INERT for a local-marketplace install. A reinstall with these patterns in
+# place still copied every path below into
+# $CODEX_HOME/plugins/cache/coordexp-local/codex-wake-me-up/<version>/.
+# Do not assume an exclusion here takes effect — verify against the cache.
+#
+# It is kept because it states packaging intent, matches the convention used by
+# the sibling codex-harnessdock plugin, and would take effect automatically if
+# the installer gains support. The practical impact of it being ignored is
+# small: an installed plugin only reads what its manifest declares
+# (skills/ and .mcp.json), so everything below is inert at runtime.
+
+# Editor and language-server state.
+.serena/
+
+# Test and build artifacts.
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Behavior contract and change history. Developer documentation and forensic
+# evidence, read in the repository rather than from an install.
+openspec/
