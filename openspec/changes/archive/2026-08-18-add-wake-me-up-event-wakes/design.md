@@ -1,8 +1,8 @@
 ## Context
 
 See [proposal.md](proposal.md) for the gap table and decision points. The two
-shipped changes ([add-codex-wake-me-up-monitor](../add-codex-wake-me-up-monitor/design.md),
-[add-best-effort-goal-self-defer](../add-best-effort-goal-self-defer/design.md))
+shipped changes ([add-codex-wake-me-up-monitor](../2026-08-18-add-codex-wake-me-up-monitor/design.md),
+[add-best-effort-goal-self-defer](../2026-08-18-add-best-effort-goal-self-defer/design.md))
 established the durable ledger, typed tri-state conditions, the deferred
 pause-once flow, the idle barrier, and the one-activation guarantee. This
 change does not touch that machinery's guarantees; it changes *which durable

@@ -27,11 +27,16 @@ step depends on it. Do useful independent work first.
 ## Expiry itself wakes a deferred goal
 
 A deferred monitor that armed successfully carries one guarantee: the goal is
-woken at the latest at its expiry, as long as the daemon lives and the target
-guard still holds. Do **not** wrap a condition in `any(condition, time)` as a
-deadline backstop — that only spends the single wake earlier and loses the
-reason. The terminal receipt records why it woke: `condition`, `expired`,
-`unauthorized_evidence`, or `observer_failed`.
+woken at the latest at its expiry, as long as the daemon lives, the target
+guard still holds, and the target is observed idle at least once after expiry.
+That last condition is what the idle barrier waits for: a thread stuck in a
+non-idle state (for example `systemError`) is never woken, so treat a monitor
+still `armed` well past its expiry as a stuck target, not a slow one.
+
+Do **not** wrap a condition in `any(condition, time)` as a deadline backstop —
+that only spends the single wake earlier and loses the reason. The terminal
+receipt records why it woke: `condition`, `expired`, `unauthorized_evidence`,
+or `observer_failed`.
 
 ## Cover failure signatures in every log watch
 
