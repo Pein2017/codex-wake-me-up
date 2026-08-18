@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -17,6 +19,18 @@ from .runtime import read_json
 
 GpuQuery = Callable[[], Mapping[int, float]]
 TmuxRun = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+# Reversible implementation budgets, not contract. They exist so one hostile
+# log line or one enormous append cannot delay every other monitor's poll.
+MAX_LOG_PATTERNS = 8
+MAX_LOG_PATTERN_CHARS = 512
+LOG_READ_BUDGET_BYTES = 4 * 1024 * 1024
+LOG_LINE_MATCH_CHARS = 4096
+LOG_EVALUATION_SECONDS = 1.0
+JOURNAL_MAX_LINES = 50
+JOURNAL_MAX_CHARS = 16 * 1024
+JOURNAL_STORED_LINE_CHARS = 512
+WITNESS_MATCHED_LINES = 5
 
 
 def _default_gpu_query() -> Mapping[int, float]:
@@ -57,6 +71,11 @@ class ObserverContext:
     proc_root: Path = Path("/proc")
     gpu_query: GpuQuery = _default_gpu_query
     tmux_run: TmuxRun = _default_tmux_run
+    # Child-thread summaries the service pre-reads through the app-server, so
+    # condition evaluation itself stays synchronous and does no protocol I/O.
+    thread_observations: dict[str, Mapping[str, Any] | None] = field(
+        default_factory=dict
+    )
 
 
 def _expect_mapping(value: Any, what: str) -> Mapping[str, Any]:
@@ -164,6 +183,131 @@ def _capture_tmux_identity(raw: Mapping[str, Any], context: ObserverContext) -> 
     }
 
 
+def _compile_log_patterns(raw: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Validate the named alternation and prove every regex compiles at arm."""
+
+    patterns = raw.get("patterns")
+    if not isinstance(patterns, list) or not patterns:
+        raise ValidationError("log_pattern.patterns must be a non-empty list")
+    if len(patterns) > MAX_LOG_PATTERNS:
+        raise ValidationError(
+            f"log_pattern.patterns must contain at most {MAX_LOG_PATTERNS} entries"
+        )
+    compiled: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in patterns:
+        item = _expect_mapping(entry, "log_pattern.patterns entry")
+        _only_keys(item, {"name", "regex"}, "log_pattern.patterns entry")
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValidationError("log_pattern.patterns entry requires a non-empty name")
+        if name in seen:
+            raise ValidationError("log_pattern.patterns must not repeat a name")
+        seen.add(name)
+        regex = item.get("regex")
+        if not isinstance(regex, str) or not regex:
+            raise ValidationError("log_pattern.patterns entry requires a non-empty regex")
+        if len(regex) > MAX_LOG_PATTERN_CHARS:
+            raise ValidationError(
+                f"log_pattern regex must be at most {MAX_LOG_PATTERN_CHARS} characters"
+            )
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            raise ValidationError(f"log_pattern regex {name} does not compile: {exc}") from exc
+        compiled.append({"name": name, "regex": regex})
+    return compiled
+
+
+def _capture_log_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture device+inode and the EOF-at-arm baseline for one local log."""
+
+    path = raw.get("path")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValidationError("log_pattern.path must be an absolute file path")
+    patterns = _compile_log_patterns(raw)
+    try:
+        info = os.stat(path)
+    except FileNotFoundError:
+        # The job may not have created its log yet. Tolerated and recorded; the
+        # leaf stays false until the file appears, then scans it from byte 0.
+        identity: dict[str, int] | None = None
+        offset = 0
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect log file {path}") from exc
+    else:
+        if not stat.S_ISREG(info.st_mode):
+            raise ValidationError("log_pattern.path must name a regular file")
+        identity = {"device": int(info.st_dev), "inode": int(info.st_ino)}
+        offset = int(info.st_size)
+    return {
+        "type": "log_pattern",
+        "path": path,
+        "patterns": patterns,
+        "identity": identity,
+        "offset": offset,
+        "missing_at_arm": identity is None,
+        "matched": False,
+        "matched_names": [],
+        "witness_lines": [],
+        "journal": {"lines": [], "dropped": 0},
+    }
+
+
+def _capture_thread_idle(
+    raw: Mapping[str, Any], context: ObserverContext
+) -> dict[str, Any]:
+    """Capture one locally loaded child thread that must still end a turn."""
+
+    child_id = raw.get("thread_id")
+    if not isinstance(child_id, str) or not child_id:
+        raise ValidationError("thread_idle.thread_id must be a non-empty thread id")
+    accept_already_idle = raw.get("accept_already_idle", False)
+    if not isinstance(accept_already_idle, bool):
+        raise ValidationError("thread_idle.accept_already_idle must be boolean")
+    snapshot = context.thread_observations.get(child_id)
+    if snapshot is None or not snapshot.get("is_loaded"):
+        raise ValidationError(
+            f"thread_idle child {child_id} is not locally loaded; only a loaded "
+            "thread can be observed through the local app-server"
+        )
+    runtime_status = str(snapshot.get("runtime_status"))
+    if runtime_status == "idle" and not accept_already_idle:
+        raise ValidationError(
+            f"thread_idle child {child_id} is already idle at registration; handle "
+            "its result in the current turn, or set accept_already_idle to wait "
+            "for a later idle observation"
+        )
+    return {
+        "type": "thread_idle",
+        "thread_id": child_id,
+        "accept_already_idle": accept_already_idle,
+        "armed_runtime_status": runtime_status,
+        "armed_snapshot": dict(snapshot),
+        "idle": False,
+        "idle_snapshot": None,
+    }
+
+
+def thread_idle_targets(condition: Mapping[str, Any]) -> list[str]:
+    """List every thread_idle child named by a raw or prepared condition."""
+
+    if not isinstance(condition, Mapping):
+        return []
+    if condition.get("type") == "thread_idle":
+        child_id = condition.get("thread_id")
+        return [child_id] if isinstance(child_id, str) and child_id else []
+    children = condition.get("children")
+    if not isinstance(children, list):
+        return []
+    found: list[str] = []
+    for child in children:
+        for item in thread_idle_targets(child):
+            if item not in found:
+                found.append(item)
+    return found
+
+
 def _validate_children(raw: Mapping[str, Any], context: ObserverContext, *, monitor_id: str, receipt_token: str) -> list[dict[str, Any]]:
     children = raw.get("children")
     if not isinstance(children, list) or not children:
@@ -253,9 +397,15 @@ def prepare_condition(
             "token": receipt_token,
             "path": str(context.runtime_root / "receipts" / f"{monitor_id}.json"),
         }
+    if condition_type == "log_pattern":
+        _only_keys(raw, {"type", "path", "patterns"}, "log_pattern")
+        return _capture_log_identity(raw)
+    if condition_type == "thread_idle":
+        _only_keys(raw, {"type", "thread_id", "accept_already_idle"}, "thread_idle")
+        return _capture_thread_idle(raw, context)
     raise ValidationError(
         "unsupported condition type; use time, gpu_stable, pid_exit, tmux_exit, "
-        "receipt_success, all, or any"
+        "log_pattern, thread_idle, receipt_success, all, or any"
     )
 
 
@@ -272,6 +422,8 @@ def _leaf(value: TriState, condition_type: str, evidence: Mapping[str, Any], *, 
         "pid_exit": "liveness",
         "tmux_exit": "liveness",
         "receipt_success": "task_success",
+        "log_pattern": "heuristic_log_content",
+        "thread_idle": "heuristic_thread_lifecycle",
     }
     rendered_evidence = dict(evidence)
     rendered_evidence.setdefault("classification", classifications.get(condition_type, "derived"))
@@ -419,6 +571,280 @@ def _evaluate_tmux(condition: Mapping[str, Any], context: ObserverContext) -> Ev
     )
 
 
+def _journal_counters(condition: Mapping[str, Any]) -> dict[str, int]:
+    journal = condition.get("journal") or {}
+    lines = journal.get("lines") or []
+    return {"lines_stored": len(lines), "dropped": int(journal.get("dropped") or 0)}
+
+
+def _append_journal(condition: MutableMapping[str, Any], lines: Sequence[str]) -> None:
+    """Keep the newest matched lines within hard caps, counting what is dropped."""
+
+    journal = dict(condition.get("journal") or {})
+    stored = [str(item) for item in (journal.get("lines") or [])]
+    dropped = int(journal.get("dropped") or 0)
+    stored.extend(line[:JOURNAL_STORED_LINE_CHARS] for line in lines)
+    while stored and (
+        len(stored) > JOURNAL_MAX_LINES
+        or sum(len(item) for item in stored) > JOURNAL_MAX_CHARS
+    ):
+        stored.pop(0)
+        dropped += 1
+    condition["journal"] = {"lines": stored, "dropped": dropped}
+
+
+def journal_tail(condition: Mapping[str, Any], *, limit: int) -> list[str]:
+    """Collect the newest matched lines from every log_pattern leaf."""
+
+    if not isinstance(condition, Mapping):
+        return []
+    if condition.get("type") == "log_pattern":
+        journal = condition.get("journal") or {}
+        return [str(item) for item in (journal.get("lines") or [])][-limit:]
+    children = condition.get("children")
+    if not isinstance(children, list):
+        return []
+    collected: list[str] = []
+    for child in children:
+        collected.extend(journal_tail(child, limit=limit))
+    return collected[-limit:]
+
+
+def elide_condition_journals(condition: Any) -> Any:
+    """Return a copy whose journal lines collapse to counters.
+
+    The stored condition embeds the journal, but the wake report's
+    ``journal_tail`` is the sole line carrier: returning the lines from status
+    and registration responses too would spend the post-wake context this
+    change exists to save.
+    """
+
+    if not isinstance(condition, Mapping):
+        return condition
+    value = dict(condition)
+    if value.get("type") == "log_pattern":
+        value["journal"] = _journal_counters(value)
+    children = value.get("children")
+    if isinstance(children, list):
+        value["children"] = [elide_condition_journals(child) for child in children]
+    return value
+
+
+def _evaluate_log_pattern(
+    condition: MutableMapping[str, Any], context: ObserverContext
+) -> Evaluation:
+    """Scan bytes appended since arming against the named alternation.
+
+    Truth latches: consumed bytes cannot be re-observed, and a leaf that
+    flapped back to false would make ``all(...)`` composition unsatisfiable.
+    """
+
+    if condition.get("matched"):
+        return _leaf(
+            TriState.TRUE,
+            "log_pattern",
+            {
+                "kind": "pattern_matched",
+                "matched": list(condition.get("matched_names") or []),
+                "matched_lines": list(condition.get("witness_lines") or []),
+                "journal": _journal_counters(condition),
+            },
+        )
+    path = Path(str(condition["path"]))
+    captured = condition.get("identity")
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        if captured is None:
+            return _leaf(
+                TriState.FALSE,
+                "log_pattern",
+                {"kind": "log_absent_since_arm", "path": str(path)},
+            )
+        # The captured inode existed and is gone: a replacement file is a
+        # different observation target and can never satisfy this leaf.
+        return _leaf(
+            TriState.UNKNOWN,
+            "log_pattern",
+            {"kind": "log_identity_lost", "path": str(path), "captured": dict(captured)},
+            fatal=True,
+        )
+    except OSError as exc:
+        return _leaf(
+            TriState.UNKNOWN, "log_pattern", {"kind": "log_stat_failed", "error": str(exc)}
+        )
+    current = {"device": int(info.st_dev), "inode": int(info.st_ino)}
+    if captured is None:
+        condition["identity"] = current
+        condition["offset"] = 0
+    elif dict(captured) != current:
+        return _leaf(
+            TriState.UNKNOWN,
+            "log_pattern",
+            {"kind": "log_identity_changed", "captured": dict(captured), "current": current},
+            fatal=True,
+        )
+    offset = int(condition.get("offset") or 0)
+    if int(info.st_size) < offset:
+        return _leaf(
+            TriState.UNKNOWN,
+            "log_pattern",
+            {"kind": "log_truncated", "offset": offset, "size": int(info.st_size)},
+            fatal=True,
+        )
+    pending = int(info.st_size) - offset
+    if pending <= 0:
+        return _leaf(
+            TriState.FALSE, "log_pattern", {"kind": "no_new_bytes", "offset": offset}
+        )
+    over_budget = pending > LOG_READ_BUDGET_BYTES
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(min(pending, LOG_READ_BUDGET_BYTES))
+    except OSError as exc:
+        return _leaf(
+            TriState.UNKNOWN, "log_pattern", {"kind": "log_read_failed", "error": str(exc)}
+        )
+    last_newline = chunk.rfind(b"\n")
+    if last_newline < 0:
+        if not over_budget:
+            # A partial trailing line is re-read whole on the next poll.
+            return _leaf(
+                TriState.FALSE,
+                "log_pattern",
+                {"kind": "partial_line_pending", "offset": offset},
+            )
+        condition["offset"] = offset + len(chunk)
+        return _leaf(
+            TriState.UNKNOWN,
+            "log_pattern",
+            {
+                "kind": "pattern_budget_exceeded",
+                "reason": "no_line_end_within_read_budget",
+                "read_budget_bytes": LOG_READ_BUDGET_BYTES,
+                "offset": condition["offset"],
+            },
+        )
+    compiled = [
+        (str(entry["name"]), re.compile(str(entry["regex"])))
+        for entry in condition["patterns"]
+    ]
+    deadline = context.now() + LOG_EVALUATION_SECONDS
+    matched_names: list[str] = []
+    matched_lines: list[str] = []
+    line_truncated = False
+    wall_clock_exceeded = False
+    consumed = 0
+    for raw_line in chunk[: last_newline + 1].splitlines(keepends=True):
+        if context.now() > deadline:
+            wall_clock_exceeded = True
+            break
+        consumed += len(raw_line)
+        text = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if len(text) > LOG_LINE_MATCH_CHARS:
+            # `re` cannot be interrupted mid-match, so bounding the line — not
+            # the wall clock — is what keeps one hostile line cheap.
+            text = text[:LOG_LINE_MATCH_CHARS]
+            line_truncated = True
+        hits = [name for name, pattern in compiled if pattern.search(text)]
+        if hits:
+            for name in hits:
+                if name not in matched_names:
+                    matched_names.append(name)
+            matched_lines.append(text)
+    condition["offset"] = offset + consumed
+    if matched_names:
+        _append_journal(condition, matched_lines)
+        witness_lines = [
+            line[:JOURNAL_STORED_LINE_CHARS]
+            for line in matched_lines[:WITNESS_MATCHED_LINES]
+        ]
+        condition["matched"] = True
+        condition["matched_names"] = matched_names
+        condition["witness_lines"] = witness_lines
+        evidence: dict[str, Any] = {
+            "kind": "pattern_matched",
+            "matched": matched_names,
+            "matched_lines": witness_lines,
+            "journal": _journal_counters(condition),
+        }
+        if line_truncated:
+            evidence["line_truncated"] = True
+        return _leaf(TriState.TRUE, "log_pattern", evidence)
+    if wall_clock_exceeded or over_budget:
+        return _leaf(
+            TriState.UNKNOWN,
+            "log_pattern",
+            {
+                "kind": "pattern_budget_exceeded",
+                "wall_clock_exceeded": wall_clock_exceeded,
+                "read_budget_exceeded": over_budget,
+                "read_budget_bytes": LOG_READ_BUDGET_BYTES,
+                "offset": condition["offset"],
+                "line_truncated": line_truncated,
+            },
+        )
+    return _leaf(
+        TriState.FALSE,
+        "log_pattern",
+        {
+            "kind": "no_pattern_match",
+            "offset": condition["offset"],
+            "line_truncated": line_truncated,
+        },
+    )
+
+
+def _evaluate_thread_idle(
+    condition: MutableMapping[str, Any], context: ObserverContext
+) -> Evaluation:
+    """Report the captured child's observed turn completion, never its success."""
+
+    child_id = str(condition["thread_id"])
+    if condition.get("idle"):
+        return _leaf(
+            TriState.TRUE,
+            "thread_idle",
+            {
+                "kind": "thread_idle",
+                "thread_id": child_id,
+                "child": dict(condition.get("idle_snapshot") or {}),
+            },
+        )
+    if child_id not in context.thread_observations:
+        return _leaf(
+            TriState.UNKNOWN,
+            "thread_idle",
+            {"kind": "thread_observation_missing", "thread_id": child_id},
+        )
+    snapshot = context.thread_observations[child_id]
+    if snapshot is None or not snapshot.get("is_loaded"):
+        # Disappearance is not completion, exactly as for a vanished tmux target.
+        return _leaf(
+            TriState.UNKNOWN,
+            "thread_idle",
+            {
+                "kind": "thread_unloaded",
+                "thread_id": child_id,
+                "child": dict(snapshot) if snapshot is not None else None,
+            },
+        )
+    if str(snapshot.get("runtime_status")) == "idle":
+        condition["idle"] = True
+        condition["idle_snapshot"] = dict(snapshot)
+        return _leaf(
+            TriState.TRUE,
+            "thread_idle",
+            {"kind": "thread_idle", "thread_id": child_id, "child": dict(snapshot)},
+        )
+    return _leaf(
+        TriState.FALSE,
+        "thread_idle",
+        {"kind": "thread_active", "thread_id": child_id, "child": dict(snapshot)},
+    )
+
+
 def _evaluate_receipt(condition: Mapping[str, Any]) -> Evaluation:
     path = Path(str(condition["path"]))
     receipt = read_json(path)
@@ -485,7 +911,13 @@ def _combine(condition_type: str, children: list[Evaluation]) -> Evaluation:
 
 
 def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverContext) -> Evaluation:
-    """Evaluate and update the condition's small durable observation state."""
+    """Evaluate and update the condition's small durable observation state.
+
+    Latching leaves (``gpu_stable`` intervals, ``log_pattern`` offsets and
+    journals, ``thread_idle`` edges) persist only through in-place mutation of
+    this mapping, which the caller must then store. Passing a copy that is not
+    persisted silently disables latching and re-reads consumed evidence.
+    """
 
     condition_type = condition.get("type")
     if condition_type == "time":
@@ -498,11 +930,23 @@ def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverCon
         return _evaluate_pid(condition, context)
     if condition_type == "tmux_exit":
         return _evaluate_tmux(condition, context)
+    if condition_type == "log_pattern":
+        return _evaluate_log_pattern(condition, context)
+    if condition_type == "thread_idle":
+        return _evaluate_thread_idle(condition, context)
     if condition_type == "receipt_success":
         return _evaluate_receipt(condition)
     if condition_type in {"all", "any"}:
         raw_children = condition.get("children")
-        if not isinstance(raw_children, list):
+        # Children must be mutable: latch state persists only through in-place
+        # mutation, so an immutable child is corrupted stored state, never a
+        # silently unlatched evaluation.
+        mutable_children = (
+            [child for child in raw_children if isinstance(child, MutableMapping)]
+            if isinstance(raw_children, list)
+            else None
+        )
+        if mutable_children is None or len(mutable_children) != len(raw_children):
             return _leaf(
                 TriState.UNKNOWN,
                 str(condition_type),
@@ -510,8 +954,7 @@ def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverCon
                 fatal=True,
             )
         children = [
-            evaluate_condition(_expect_mapping(child, "stored condition child"), context)
-            for child in raw_children
+            evaluate_condition(child, context) for child in mutable_children
         ]
         return _combine(str(condition_type), children)
     return _leaf(

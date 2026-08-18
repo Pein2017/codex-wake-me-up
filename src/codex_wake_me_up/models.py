@@ -44,6 +44,19 @@ class MonitorMode(StrEnum):
     DEFERRED = "deferred"
 
 
+class WakeReason(StrEnum):
+    """Which durable fact consumed a monitor's single guarded activation.
+
+    The wake policy re-routes facts into ``CLAIMED``; it adds no phase. A
+    reason other than ``CONDITION`` is never a task-success claim.
+    """
+
+    CONDITION = "condition"
+    EXPIRED = "expired"
+    UNAUTHORIZED_EVIDENCE = "unauthorized_evidence"
+    OBSERVER_FAILED = "observer_failed"
+
+
 TERMINAL_STATES = frozenset(
     {
         MonitorState.FIRED,

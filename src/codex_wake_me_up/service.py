@@ -8,15 +8,18 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Mapping, MutableMapping
+from typing import Any, AsyncContextManager, Callable, Mapping, MutableMapping, Sequence
 
 from .app_server import AppServerClient
 from .conditions import (
     ObserverContext,
+    elide_condition_journals,
     evaluate_condition,
+    journal_tail,
     prepare_condition,
     public_condition_semantics,
     receipt_payload,
+    thread_idle_targets,
     witness_authorizes_continuation,
 )
 from .ledger import Ledger, MonitorRecord
@@ -28,6 +31,8 @@ from .models import (
     TargetObservation,
     TriState,
     ValidationError,
+    WakeReason,
+    is_terminal,
 )
 from .runtime import (
     atomic_write_json,
@@ -42,6 +47,11 @@ from .runtime import (
 
 AppServerFactory = Callable[[], AsyncContextManager[AppServerClient]]
 ObserverContextFactory = Callable[[], ObserverContext]
+
+# The repo's long-poll yield floor: what one avoided polling turn would cost.
+POLL_YIELD_FLOOR_SECONDS = 180.0
+WAKE_JOURNAL_TAIL_LINES = 20
+MAX_REARM_CHAIN = 20
 
 
 class MonitorService:
@@ -96,6 +106,111 @@ class MonitorService:
             and first.goal == second.goal
         )
 
+    @staticmethod
+    def _thread_observation_summary(observation: TargetObservation) -> dict[str, Any]:
+        snapshot = observation.goal_snapshot or {}
+        return {
+            "thread_id": observation.thread_id,
+            "runtime_status": observation.runtime_status,
+            "is_loaded": observation.is_loaded,
+            "goal_status": observation.goal_status,
+            "usage": (
+                {
+                    "tokens_used": snapshot.get("tokensUsed"),
+                    "time_used_seconds": snapshot.get("timeUsedSeconds"),
+                    "token_budget": snapshot.get("tokenBudget"),
+                }
+                if observation.goal_snapshot
+                else None
+            ),
+        }
+
+    async def _read_thread_observations(
+        self, app_server: Any, targets: Sequence[str]
+    ) -> dict[str, Mapping[str, Any] | None]:
+        """Pre-read every thread_idle child so evaluation stays synchronous."""
+
+        observations: dict[str, Mapping[str, Any] | None] = {}
+        for child_id in targets:
+            try:
+                child = await app_server.read_observation(child_id)
+            except AppServerError:
+                observations[child_id] = None
+            else:
+                observations[child_id] = self._thread_observation_summary(child)
+        return observations
+
+    @staticmethod
+    def _reject_self_wait(condition: Mapping[str, Any], thread_id: str) -> list[str]:
+        """A monitor cannot wait on the very thread its wake would activate."""
+
+        children = thread_idle_targets(condition)
+        if thread_id in children:
+            raise ValidationError(
+                "thread_idle must not name the monitor's own target thread"
+            )
+        return children
+
+    def _validate_rearm_of(self, rearm_of: str | None) -> None:
+        if rearm_of is None:
+            return
+        if not isinstance(rearm_of, str) or not rearm_of:
+            raise ValidationError("rearm_of must be a non-empty monitor id when provided")
+        referenced = self.ledger.get(rearm_of)
+        if referenced is None:
+            raise ValidationError(f"rearm_of names an unknown monitor: {rearm_of}")
+        if not is_terminal(referenced.state):
+            raise ValidationError(
+                "rearm_of must name a terminal monitor; a live monitor cannot be a lineage parent"
+            )
+
+    def _rearm_chain(self, record: MonitorRecord) -> list[str]:
+        chain: list[str] = []
+        seen = {record.monitor_id}
+        parent = record.rearm_of
+        while parent is not None and parent not in seen and len(chain) < MAX_REARM_CHAIN:
+            chain.append(parent)
+            seen.add(parent)
+            ancestor = self.ledger.get(parent)
+            parent = ancestor.rearm_of if ancestor is not None else None
+        return chain
+
+    def _wake_report(
+        self, record: MonitorRecord, *, fired_at: float
+    ) -> dict[str, Any]:
+        """Assemble everything one post-wake status call must answer."""
+
+        reason = record.wake_reason
+        if reason is None:
+            # A row claimed before this change stores no reason; derive the
+            # honest label from the witness rather than claiming authorization.
+            reason = WakeReason.CONDITION
+            if record.mode == MonitorMode.DEFERRED and not witness_authorizes_continuation(
+                record.witness,
+                allow_heuristic_continuation=record.allow_heuristic_continuation,
+            ):
+                reason = WakeReason.UNAUTHORIZED_EVIDENCE
+        waited = (
+            max(0.0, fired_at - record.armed_at) if record.armed_at is not None else None
+        )
+        report: dict[str, Any] = {
+            "wake_reason": reason.value,
+            "witness": list(record.witness),
+            "armed_at": record.armed_at,
+            "fired_at": fired_at,
+            "waited_seconds": waited,
+            "evaluation_count": record.evaluation_count,
+            "avoided_poll_turns": (
+                int(waited // POLL_YIELD_FLOOR_SECONDS) if waited is not None else None
+            ),
+        }
+        if reason == WakeReason.OBSERVER_FAILED:
+            report["failure_detail"] = dict(record.evidence)
+        tail = journal_tail(record.condition, limit=WAKE_JOURNAL_TAIL_LINES)
+        if tail:
+            report["journal_tail"] = tail
+        return report
+
     async def register(
         self,
         *,
@@ -104,6 +219,7 @@ class MonitorService:
         expires_in_seconds: float,
         allow_heuristic_continuation: bool = False,
         idempotency_key: str | None = None,
+        rearm_of: str | None = None,
         start_daemon: bool = True,
     ) -> dict[str, Any]:
         if not thread_id:
@@ -118,6 +234,7 @@ class MonitorService:
             raise ValidationError("allow_heuristic_continuation must be boolean")
         if idempotency_key is not None and not idempotency_key:
             raise ValidationError("idempotency_key must be non-empty when provided")
+        self._validate_rearm_of(rearm_of)
 
         observer_context = self.observer_context_factory()
         async with self.app_server_factory() as app_server:
@@ -127,6 +244,7 @@ class MonitorService:
                     "target must be locally loaded and own a paused goal at registration"
                 )
             assert first.goal is not None
+            children = self._reject_self_wait(condition, thread_id)
             guard = TargetGuard(thread_id=thread_id, goal=first.goal)
             semantic = {
                 "thread_id": thread_id,
@@ -135,6 +253,10 @@ class MonitorService:
                 "expires_in_seconds": float(expires_in_seconds),
                 "allow_heuristic_continuation": bool(allow_heuristic_continuation),
             }
+            if rearm_of is not None:
+                # Only present when requested, so an idempotent replay of a
+                # monitor armed before this change still matches byte for byte.
+                semantic["rearm_of"] = rearm_of
             if idempotency_key is not None:
                 existing = self.ledger.get_by_idempotency_key(idempotency_key)
                 if existing is not None:
@@ -151,6 +273,9 @@ class MonitorService:
                     return self._registration_response(record)
             monitor_id = str(uuid.uuid4())
             receipt_token = secrets.token_urlsafe(32)
+            observer_context.thread_observations.update(
+                await self._read_thread_observations(app_server, children)
+            )
             prepared_condition = prepare_condition(
                 condition,
                 observer_context,
@@ -165,6 +290,7 @@ class MonitorService:
                 condition=prepared_condition,
                 allow_heuristic_continuation=allow_heuristic_continuation,
                 expires_at=observer_context.now() + float(expires_in_seconds),
+                rearm_of=rearm_of,
             )
             if created:
                 second = await app_server.read_observation(thread_id)
@@ -198,6 +324,7 @@ class MonitorService:
         expires_in_seconds: float,
         allow_heuristic_continuation: bool = False,
         idempotency_key: str,
+        rearm_of: str | None = None,
     ) -> dict[str, Any]:
         """Best-effort pause of one explicit loaded active goal into a monitor."""
 
@@ -216,6 +343,7 @@ class MonitorService:
             raise ValidationError("allow_heuristic_continuation must be boolean")
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValidationError("idempotency_key must be non-empty")
+        self._validate_rearm_of(rearm_of)
 
         observer_context = self.observer_context_factory()
         async with self.app_server_factory() as app_server:
@@ -224,6 +352,7 @@ class MonitorService:
                 raise ValidationError(
                     "defer target must be locally loaded and own a non-null goal"
                 )
+            children = self._reject_self_wait(condition, thread_id)
             guard = TargetGuard(thread_id=thread_id, goal=first.goal)
             semantic = {
                 "thread_id": thread_id,
@@ -234,6 +363,8 @@ class MonitorService:
                     allow_heuristic_continuation
                 ),
             }
+            if rearm_of is not None:
+                semantic["rearm_of"] = rearm_of
             existing = self.ledger.get_by_idempotency_key(idempotency_key)
             if existing is not None:
                 if (
@@ -254,6 +385,9 @@ class MonitorService:
 
             monitor_id = str(uuid.uuid4())
             receipt_token = secrets.token_urlsafe(32)
+            observer_context.thread_observations.update(
+                await self._read_thread_observations(app_server, children)
+            )
             prepared_condition = prepare_condition(
                 condition,
                 observer_context,
@@ -277,6 +411,7 @@ class MonitorService:
                     mode=MonitorMode.DEFERRED,
                     idle_barrier=True,
                     initial_state=MonitorState.DEFER_INTENT,
+                    rearm_of=rearm_of,
                 )
                 if not created:
                     response = self._registration_response(record)
@@ -452,6 +587,12 @@ class MonitorService:
         if record is None:
             raise ValidationError(f"unknown monitor: {monitor_id}")
         value = record.status_dict()
+        # The wake report's journal_tail is the sole line carrier; here the
+        # stored journal collapses to counters so post-wake context is spent once.
+        value["condition"] = elide_condition_journals(record.condition)
+        chain = self._rearm_chain(record)
+        if chain:
+            value["rearm_chain"] = chain
         if record.state in {MonitorState.ARMED, MonitorState.CLAIMED}:
             value["supervision"] = (
                 "healthy" if daemon_is_healthy(self.root) else "unsupervised"
@@ -506,7 +647,7 @@ class MonitorService:
             if record.state not in {MonitorState.ARMED, MonitorState.CLAIMED}:
                 continue
             try:
-                if record.expires_at <= now:
+                if record.expires_at <= now and record.mode == MonitorMode.LEGACY:
                     expired = self.ledger.transition(
                         record.monitor_id,
                         expected=(record.state,),
@@ -516,9 +657,19 @@ class MonitorService:
                     if expired is not None:
                         transitions.append(self.status(expired.monitor_id))
                     continue
+                # A deferred row past its expiry is not terminal here: an armed
+                # one becomes claim-eligible with reason `expired` below, and a
+                # claimed one (e.g. found after a daemon restart) continues its
+                # wake. Writing EXPIRED here would re-strand the paused goal.
                 if record.state == MonitorState.ARMED:
+                    observer_context = self.observer_context_factory()
+                    children = thread_idle_targets(record.condition)
                     if record.mode == MonitorMode.DEFERRED:
                         if not record.idle_barrier:
+                            # A deferred row without its idle barrier is a
+                            # corrupted row, not a wake-eligible fact: waking
+                            # from unverified state is exactly what the barrier
+                            # exists to prevent, so this stays fail-closed.
                             failed = self.ledger.transition(
                                 record.monitor_id,
                                 expected=(MonitorState.ARMED,),
@@ -531,13 +682,22 @@ class MonitorService:
                             if failed is not None:
                                 transitions.append(self.status(failed.monitor_id))
                             continue
-                        can_evaluate = await self._deferred_target_is_idle(record)
+                        can_evaluate = await self._deferred_target_is_idle(
+                            record, children, observer_context
+                        )
                         if not can_evaluate:
                             current = self.ledger.get(record.monitor_id)
                             if current is not None and current.state != MonitorState.ARMED:
                                 transitions.append(self.status(current.monitor_id))
                             continue
-                    claimed = self._evaluate_and_claim(record)
+                    elif children:
+                        async with self.app_server_factory() as app_server:
+                            observer_context.thread_observations.update(
+                                await self._read_thread_observations(
+                                    app_server, children
+                                )
+                            )
+                    claimed = self._evaluate_and_claim(record, observer_context)
                     if claimed is None:
                         continue
                     record = claimed
@@ -553,36 +713,51 @@ class MonitorService:
                     transitions.append(self.status(failed.monitor_id))
         return transitions
 
-    async def _deferred_target_is_idle(self, record: MonitorRecord) -> bool:
-        """Preflight a deferred target before evaluating even a true condition."""
+    async def _deferred_target_is_idle(
+        self,
+        record: MonitorRecord,
+        children: Sequence[str],
+        observer_context: ObserverContext,
+    ) -> bool:
+        """Preflight a deferred target before evaluating even a true condition.
+
+        Child-thread summaries are read in this same session, and only once the
+        target is genuinely evaluable, so a busy target costs one read per poll.
+        """
 
         async with self.app_server_factory() as app_server:
             observation = await app_server.read_observation(record.target.thread_id)
-        if not observation.is_loaded:
-            self.ledger.transition(
-                record.monitor_id,
-                expected=(MonitorState.ARMED,),
-                state=MonitorState.UNLOADED_TARGET,
-                outcome={
-                    "kind": "unloaded_target_before_deferred_evaluation",
-                    "observation": self._observation_summary(observation),
-                    "at": time.time(),
-                },
-            )
-            return False
-        if not observation.matches_guard(record.target):
-            self.ledger.transition(
-                record.monitor_id,
-                expected=(MonitorState.ARMED,),
-                state=MonitorState.SUPERSEDED,
-                outcome={
-                    "kind": "deferred_evaluation_guard_changed",
-                    "observation": self._observation_summary(observation),
-                    "at": time.time(),
-                },
-            )
-            return False
-        return observation.runtime_status == "idle"
+            if not observation.is_loaded:
+                self.ledger.transition(
+                    record.monitor_id,
+                    expected=(MonitorState.ARMED,),
+                    state=MonitorState.UNLOADED_TARGET,
+                    outcome={
+                        "kind": "unloaded_target_before_deferred_evaluation",
+                        "observation": self._observation_summary(observation),
+                        "at": time.time(),
+                    },
+                )
+                return False
+            if not observation.matches_guard(record.target):
+                self.ledger.transition(
+                    record.monitor_id,
+                    expected=(MonitorState.ARMED,),
+                    state=MonitorState.SUPERSEDED,
+                    outcome={
+                        "kind": "deferred_evaluation_guard_changed",
+                        "observation": self._observation_summary(observation),
+                        "at": time.time(),
+                    },
+                )
+                return False
+            if observation.runtime_status != "idle":
+                return False
+            if children:
+                observer_context.thread_observations.update(
+                    await self._read_thread_observations(app_server, children)
+                )
+            return True
 
     def _record_unexpected_failure(
         self, record: MonitorRecord, error: Exception
@@ -591,6 +766,26 @@ class MonitorService:
 
         current = self.ledger.get(record.monitor_id)
         if current is None:
+            return None
+        if (
+            current.mode == MonitorMode.DEFERRED
+            and current.state in {MonitorState.ARMED, MonitorState.CLAIMED}
+        ):
+            # An untyped failure (e.g. a transient app-server socket error) is
+            # not an irrecoverable observer identity, and no activation packet
+            # has been sent from either state. Stranding the paused goal or
+            # burning its single wake would both be wrong: record the evidence,
+            # stay retryable, and let expiry be the backstop.
+            self.ledger.transition(
+                current.monitor_id,
+                expected=(current.state,),
+                state=current.state,
+                outcome={
+                    "kind": "transient_observation_failure_recorded",
+                    "error": f"{type(error).__name__}: {error}",
+                    "at": time.time(),
+                },
+            )
             return None
         if current.state == MonitorState.ARMED:
             state = MonitorState.OBSERVER_FAILED
@@ -611,9 +806,19 @@ class MonitorService:
             },
         )
 
-    def _evaluate_and_claim(self, record: MonitorRecord) -> MonitorRecord | None:
+    def _evaluate_and_claim(
+        self, record: MonitorRecord, observer_context: ObserverContext
+    ) -> MonitorRecord | None:
+        """Convert one observed fact into the monitor's single durable claim.
+
+        For a deferred monitor every wake-eligible fact — an authorized
+        condition, unauthorized heuristic evidence, an irrecoverable observer
+        identity, and the deadline itself — is consumed through this one claim,
+        so "at most one activation request" stays a single-table CAS fact.
+        """
+
         condition: MutableMapping[str, Any] = copy.deepcopy(dict(record.condition))
-        evaluation = evaluate_condition(condition, self.observer_context_factory())
+        evaluation = evaluate_condition(condition, observer_context)
         updated = self.ledger.update_evaluation(
             record.monitor_id,
             condition=condition,
@@ -622,7 +827,34 @@ class MonitorService:
         )
         if updated is None:
             return None
-        if evaluation.fatal and evaluation.value != TriState.TRUE:
+        deferred = record.mode == MonitorMode.DEFERRED
+        if evaluation.value == TriState.TRUE:
+            wake_reason: WakeReason | None = None
+            if deferred:
+                wake_reason = (
+                    WakeReason.CONDITION
+                    if witness_authorizes_continuation(
+                        evaluation.witness,
+                        allow_heuristic_continuation=record.allow_heuristic_continuation,
+                    )
+                    else WakeReason.UNAUTHORIZED_EVIDENCE
+                )
+            return self.ledger.claim(
+                record.monitor_id,
+                condition=condition,
+                evidence=evaluation.evidence,
+                witness=evaluation.witness,
+                wake_reason=wake_reason,
+            )
+        if evaluation.fatal:
+            if deferred:
+                return self.ledger.claim(
+                    record.monitor_id,
+                    condition=condition,
+                    evidence=evaluation.evidence,
+                    witness=evaluation.witness,
+                    wake_reason=WakeReason.OBSERVER_FAILED,
+                )
             return self.ledger.transition(
                 record.monitor_id,
                 expected=(MonitorState.ARMED,),
@@ -631,17 +863,22 @@ class MonitorService:
                 witness=evaluation.witness,
                 outcome={"kind": "observer_identity_failed", "at": time.time()},
             )
-        if evaluation.value != TriState.TRUE:
-            return None
-        return self.ledger.claim(
-            record.monitor_id,
-            condition=condition,
-            evidence=evaluation.evidence,
-            witness=evaluation.witness,
-        )
+        if deferred and observer_context.now() >= record.expires_at:
+            return self.ledger.claim(
+                record.monitor_id,
+                condition=condition,
+                evidence=evaluation.evidence,
+                witness=evaluation.witness,
+                wake_reason=WakeReason.EXPIRED,
+            )
+        return None
 
     async def _finish_claim(self, record: MonitorRecord) -> MonitorRecord | None:
-        if not witness_authorizes_continuation(
+        # `mode`, not the stored wake reason, decides the two deferred skips: a
+        # deferred row claimed before this change carries a NULL reason after
+        # migration, and gating on NULL would strand it exactly as before.
+        deferred = record.mode == MonitorMode.DEFERRED
+        if not deferred and not witness_authorizes_continuation(
             record.witness,
             allow_heuristic_continuation=record.allow_heuristic_continuation,
         ):
@@ -681,7 +918,7 @@ class MonitorService:
                         },
                     )
                 activation_now = self.observer_context_factory().now()
-                if activation_now >= record.expires_at:
+                if not deferred and activation_now >= record.expires_at:
                     return self.ledger.transition(
                         record.monitor_id,
                         expected=(MonitorState.CLAIMED,),
@@ -711,6 +948,20 @@ class MonitorService:
                         outcome={"kind": "activation_transport_uncertain", "error": str(exc), "at": time.time()},
                     )
         except AppServerError as exc:
+            if deferred:
+                # Nothing has been sent yet, so this read failure is safely
+                # retryable. Terminating here would strand the paused goal.
+                self.ledger.transition(
+                    record.monitor_id,
+                    expected=(MonitorState.CLAIMED,),
+                    state=MonitorState.CLAIMED,
+                    outcome={
+                        "kind": "deferred_preflight_retryable",
+                        "error": str(exc),
+                        "at": time.time(),
+                    },
+                )
+                return None
             return self.ledger.transition(
                 record.monitor_id,
                 expected=(MonitorState.CLAIMED,),
@@ -747,6 +998,7 @@ class MonitorService:
                     "at": time.time(),
                 },
             )
+        fired_at = time.time()
         return self.ledger.transition(
             record.monitor_id,
             expected=(MonitorState.ACTIVATING,),
@@ -754,7 +1006,8 @@ class MonitorService:
             outcome={
                 "kind": "activation_confirmed",
                 "returned_goal": returned.goal.as_dict() if returned.goal else None,
-                "at": time.time(),
+                "at": fired_at,
+                **self._wake_report(record, fired_at=fired_at),
             },
         )
 

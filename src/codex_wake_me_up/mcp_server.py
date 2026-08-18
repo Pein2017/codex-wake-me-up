@@ -31,8 +31,9 @@ def service() -> MonitorService:
     name="wake_me_up",
     description=(
         "Arm one typed, durable local monitor for a loaded paused Codex goal. "
-        "Use allow_heuristic_continuation only when time/GPU/PID/tmux evidence "
-        "is intentionally sufficient to continue the goal."
+        "Use allow_heuristic_continuation only when time/GPU/PID/tmux/log/thread "
+        "evidence is intentionally sufficient to continue the goal. Pass rearm_of "
+        "to record lineage from the terminal monitor this one succeeds."
     ),
 )
 async def wake_me_up(
@@ -41,6 +42,7 @@ async def wake_me_up(
     expires_in_seconds: float,
     allow_heuristic_continuation: bool = False,
     idempotency_key: str | None = None,
+    rearm_of: str | None = None,
 ) -> dict[str, Any]:
     return await service().register(
         thread_id=thread_id,
@@ -48,6 +50,7 @@ async def wake_me_up(
         expires_in_seconds=expires_in_seconds,
         allow_heuristic_continuation=allow_heuristic_continuation,
         idempotency_key=idempotency_key,
+        rearm_of=rearm_of,
     )
 
 
@@ -58,7 +61,8 @@ async def wake_me_up(
         "loaded active goal. The supplied thread ID is not authenticated as the "
         "caller's current task. The watcher must be positively ready before pause; "
         "after an armed receipt, end the current turn immediately without sleeping "
-        "or polling. This tool cannot mechanically end a running turn."
+        "or polling. This tool cannot mechanically end a running turn. Expiry itself "
+        "wakes a deferred goal; pass rearm_of to record lineage from a fired monitor."
     ),
 )
 async def wake_me_up_defer(
@@ -67,6 +71,7 @@ async def wake_me_up_defer(
     expires_in_seconds: float,
     idempotency_key: str,
     allow_heuristic_continuation: bool = False,
+    rearm_of: str | None = None,
 ) -> dict[str, Any]:
     return await service().defer(
         thread_id=thread_id,
@@ -74,6 +79,7 @@ async def wake_me_up_defer(
         expires_in_seconds=expires_in_seconds,
         allow_heuristic_continuation=allow_heuristic_continuation,
         idempotency_key=idempotency_key,
+        rearm_of=rearm_of,
     )
 
 

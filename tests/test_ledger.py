@@ -4,7 +4,7 @@ import json
 import sqlite3
 
 from codex_wake_me_up.ledger import Ledger
-from codex_wake_me_up.models import MonitorMode, MonitorState, TargetGuard
+from codex_wake_me_up.models import MonitorMode, MonitorState, TargetGuard, WakeReason
 
 from .helpers import goal
 
@@ -179,3 +179,120 @@ def test_existing_ledger_migrates_rows_to_legacy_mode(tmp_path) -> None:
     assert migrated is not None
     assert migrated.mode == MonitorMode.LEGACY
     assert not migrated.idle_barrier
+
+
+def test_pre_wake_reason_schema_migrates_and_behaves_unchanged(tmp_path) -> None:
+    """A database written before wake reasons must load and still transition."""
+
+    database = sqlite3.connect(tmp_path / "monitors.sqlite3")
+    database.execute(
+        """
+        CREATE TABLE monitors (
+            monitor_id TEXT PRIMARY KEY,
+            idempotency_key TEXT UNIQUE,
+            semantic_json TEXT NOT NULL,
+            target_json TEXT NOT NULL,
+            condition_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'legacy',
+            idle_barrier INTEGER NOT NULL DEFAULT 0,
+            allow_heuristic_continuation INTEGER NOT NULL,
+            expires_at REAL NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            witness_json TEXT NOT NULL DEFAULT '[]',
+            outcome_json TEXT,
+            activation_snapshot_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    database.execute(
+        """
+        INSERT INTO monitors(
+            monitor_id, idempotency_key, semantic_json, target_json,
+            condition_json, state, mode, idle_barrier,
+            allow_heuristic_continuation, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "armed-before-upgrade",
+            "old-key",
+            json.dumps({"same": True}),
+            json.dumps(TargetGuard("test-thread", goal()).as_dict()),
+            json.dumps({"type": "time", "deadline_utc": 0}),
+            MonitorState.ARMED.value,
+            MonitorMode.DEFERRED.value,
+            1,
+            1,
+            10_000,
+            1,
+            1,
+        ),
+    )
+    database.commit()
+    database.close()
+
+    ledger = Ledger(tmp_path)
+    migrated = ledger.get("armed-before-upgrade")
+    assert migrated is not None
+    assert migrated.mode == MonitorMode.DEFERRED
+    assert migrated.idle_barrier
+    assert migrated.allow_heuristic_continuation
+    assert migrated.expires_at == 10_000
+    # The new columns default without disturbing anything the row already held.
+    assert migrated.wake_reason is None
+    assert migrated.rearm_of is None
+    assert migrated.evaluation_count == 0
+    assert migrated.armed_at is None
+
+    evaluated = ledger.update_evaluation(
+        migrated.monitor_id,
+        condition={"type": "time", "deadline_utc": 0},
+        evidence={"ok": True},
+        witness=[{"type": "time"}],
+    )
+    assert evaluated is not None
+    assert evaluated.evaluation_count == 1
+    claimed = ledger.claim(
+        migrated.monitor_id,
+        condition={"type": "time", "deadline_utc": 0},
+        evidence={"ok": True},
+        witness=[{"type": "time"}],
+        wake_reason=WakeReason.EXPIRED,
+    )
+    assert claimed is not None
+    assert claimed.state == MonitorState.CLAIMED
+    assert claimed.wake_reason == WakeReason.EXPIRED
+    assert claimed.evaluation_count == 1
+
+
+def test_arm_stamps_armed_at_and_evaluations_accumulate(tmp_path) -> None:
+    ledger = Ledger(tmp_path)
+    record, _ = ledger.create_or_get(
+        monitor_id="monitor",
+        idempotency_key=None,
+        semantic={"same": True},
+        target=TargetGuard("test-thread", goal()),
+        condition={"type": "time", "deadline_utc": 0},
+        allow_heuristic_continuation=True,
+        expires_at=10_000,
+        rearm_of=None,
+    )
+    assert record.armed_at is None
+
+    armed = ledger.arm(record.monitor_id)
+    assert armed is not None
+    assert armed.armed_at is not None
+    for _ in range(3):
+        ledger.update_evaluation(
+            record.monitor_id,
+            condition={"type": "time", "deadline_utc": 0},
+            evidence={},
+            witness=[],
+        )
+
+    current = ledger.get(record.monitor_id)
+    assert current is not None
+    assert current.evaluation_count == 3
+    assert current.armed_at == armed.armed_at

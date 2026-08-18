@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .models import ConflictError, MonitorMode, MonitorState, TargetGuard, is_terminal
+from .models import (
+    ConflictError,
+    MonitorMode,
+    MonitorState,
+    TargetGuard,
+    WakeReason,
+    is_terminal,
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -41,6 +48,10 @@ class MonitorRecord:
     activation_snapshot: Mapping[str, Any] | None
     created_at: float
     updated_at: float
+    wake_reason: WakeReason | None = None
+    rearm_of: str | None = None
+    evaluation_count: int = 0
+    armed_at: float | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "MonitorRecord":
@@ -61,6 +72,16 @@ class MonitorRecord:
             activation_snapshot=_load(row["activation_snapshot_json"], None),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            wake_reason=(
+                WakeReason(row["wake_reason"])
+                if row["wake_reason"] is not None
+                else None
+            ),
+            rearm_of=row["rearm_of"],
+            evaluation_count=int(row["evaluation_count"] or 0),
+            armed_at=(
+                float(row["armed_at"]) if row["armed_at"] is not None else None
+            ),
         )
 
     def status_dict(self) -> dict[str, Any]:
@@ -80,6 +101,10 @@ class MonitorRecord:
             "activation_snapshot": self.activation_snapshot,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "wake_reason": self.wake_reason.value if self.wake_reason else None,
+            "rearm_of": self.rearm_of,
+            "evaluation_count": self.evaluation_count,
+            "armed_at": self.armed_at,
         }
 
 
@@ -133,7 +158,11 @@ class Ledger:
                 outcome_json TEXT,
                 activation_snapshot_json TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                wake_reason TEXT,
+                rearm_of TEXT,
+                evaluation_count INTEGER NOT NULL DEFAULT 0,
+                armed_at REAL
             )
             """
         )
@@ -149,6 +178,18 @@ class Ledger:
             connection.execute(
                 "ALTER TABLE monitors ADD COLUMN idle_barrier INTEGER NOT NULL DEFAULT 0"
             )
+        # Wake-reason bookkeeping is additive: every column either defaults or
+        # stays NULL, so rows written before this change load unchanged.
+        if "wake_reason" not in columns:
+            connection.execute("ALTER TABLE monitors ADD COLUMN wake_reason TEXT")
+        if "rearm_of" not in columns:
+            connection.execute("ALTER TABLE monitors ADD COLUMN rearm_of TEXT")
+        if "evaluation_count" not in columns:
+            connection.execute(
+                "ALTER TABLE monitors ADD COLUMN evaluation_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "armed_at" not in columns:
+            connection.execute("ALTER TABLE monitors ADD COLUMN armed_at REAL")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS monitors_state_expiry ON monitors(state, expires_at)"
         )
@@ -235,6 +276,7 @@ class Ledger:
         mode: MonitorMode = MonitorMode.LEGACY,
         idle_barrier: bool = False,
         initial_state: MonitorState = MonitorState.REGISTERING,
+        rearm_of: str | None = None,
     ) -> tuple[MonitorRecord, bool]:
         """Create a monitor intent, or return its identical keyed ancestor."""
 
@@ -259,8 +301,9 @@ class Ledger:
                 INSERT INTO monitors(
                     monitor_id, idempotency_key, semantic_json, target_json,
                     condition_json, state, mode, idle_barrier,
-                    allow_heuristic_continuation, expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    allow_heuristic_continuation, expires_at, created_at,
+                    updated_at, rearm_of
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     monitor_id,
@@ -275,6 +318,7 @@ class Ledger:
                     expires_at,
                     now,
                     now,
+                    rearm_of,
                 ),
             )
             row = transaction.execute(
@@ -298,14 +342,26 @@ class Ledger:
         witness: Iterable[Mapping[str, Any]] | None = None,
         condition: Mapping[str, Any] | None = None,
         activation_snapshot: Mapping[str, Any] | None = None,
+        wake_reason: WakeReason | None = None,
+        stamp_armed_at: bool = False,
+        increment_evaluation: bool = False,
     ) -> MonitorRecord | None:
         """Atomically update a monitor if it remains in an allowed state."""
 
         allowed = tuple(item.value for item in expected)
         if not allowed:
             raise ValueError("transition requires at least one expected state")
+        now = time.time()
         assignments = ["state = ?", "updated_at = ?"]
-        parameters: list[Any] = [state.value, time.time()]
+        parameters: list[Any] = [state.value, now]
+        if wake_reason is not None:
+            assignments.append("wake_reason = ?")
+            parameters.append(wake_reason.value)
+        if stamp_armed_at:
+            assignments.append("armed_at = ?")
+            parameters.append(now)
+        if increment_evaluation:
+            assignments.append("evaluation_count = evaluation_count + 1")
         if outcome is not None:
             assignments.append("outcome_json = ?")
             parameters.append(canonical_json(outcome))
@@ -358,6 +414,7 @@ class Ledger:
             condition=condition,
             evidence=evidence,
             witness=witness,
+            increment_evaluation=True,
         )
 
     def arm(self, monitor_id: str) -> MonitorRecord | None:
@@ -365,6 +422,7 @@ class Ledger:
             monitor_id,
             expected=(MonitorState.REGISTERING,),
             state=MonitorState.ARMED,
+            stamp_armed_at=True,
         )
 
     def begin_pause(
@@ -388,6 +446,7 @@ class Ledger:
             monitor_id,
             expected=(MonitorState.PAUSING,),
             state=MonitorState.ARMED,
+            stamp_armed_at=True,
             outcome={
                 "kind": "pause_confirmed",
                 "confirmation": dict(confirmation),
@@ -402,6 +461,7 @@ class Ledger:
         condition: Mapping[str, Any],
         evidence: Mapping[str, Any],
         witness: Iterable[Mapping[str, Any]],
+        wake_reason: WakeReason | None = None,
     ) -> MonitorRecord | None:
         return self.transition(
             monitor_id,
@@ -410,7 +470,12 @@ class Ledger:
             condition=condition,
             evidence=evidence,
             witness=witness,
-            outcome={"kind": "trigger_claimed", "at": time.time()},
+            wake_reason=wake_reason,
+            outcome={
+                "kind": "trigger_claimed",
+                "wake_reason": wake_reason.value if wake_reason else None,
+                "at": time.time(),
+            },
         )
 
     def cancel(self, monitor_id: str) -> MonitorRecord | None:

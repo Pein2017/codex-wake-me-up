@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from codex_wake_me_up.models import GoalMarker, TargetObservation
 
@@ -60,6 +60,7 @@ class FakeAppServer:
         activation: TargetObservation | Exception | None = None,
         pause: TargetObservation | Exception | None = None,
         on_pause: Callable[[], None] | None = None,
+        thread_observations: Mapping[str, Any] | None = None,
     ):
         self.observations = deque(observations)
         self.last_observation: TargetObservation | None = None
@@ -68,6 +69,11 @@ class FakeAppServer:
         self.on_pause = on_pause
         self.activation_calls: list[str] = []
         self.pause_calls: list[str] = []
+        # Reads for an explicitly named thread (a `thread_idle` child) are
+        # served from here instead of the monitor target's own queue. A value
+        # may be one observation, a list consumed in order, or an exception.
+        self.thread_observations = dict(thread_observations or {})
+        self.child_reads: list[str] = []
 
     async def __aenter__(self) -> "FakeAppServer":
         return self
@@ -75,7 +81,18 @@ class FakeAppServer:
     async def __aexit__(self, *_args: Any) -> None:
         return None
 
-    async def read_observation(self, _thread_id: str) -> TargetObservation:
+    async def read_observation(self, thread_id: str) -> TargetObservation:
+        if thread_id in self.thread_observations:
+            self.child_reads.append(thread_id)
+            scripted = self.thread_observations[thread_id]
+            if isinstance(scripted, list):
+                if len(scripted) > 1:
+                    scripted = scripted.pop(0)
+                else:
+                    scripted = scripted[0]
+            if isinstance(scripted, Exception):
+                raise scripted
+            return scripted
         if self.observations:
             self.last_observation = self.observations.popleft()
         assert self.last_observation is not None
