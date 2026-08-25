@@ -9,8 +9,18 @@ import os
 import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import Any, Callable
 
-from .runtime import runtime_root, write_heartbeat
+from .app_server import AppServerClient
+from .delivery import DeliveryKind
+from .ledger import Ledger
+from .runtime import (
+    DELIVERY_CAPABILITY_EPOCH,
+    EVENT_CAPABILITY_EPOCH,
+    codex_home_for_runtime_root,
+    runtime_root,
+    write_heartbeat,
+)
 from .service import MonitorService
 
 
@@ -45,9 +55,86 @@ class DaemonLock(AbstractContextManager["DaemonLock"]):
                 self.handle = None
 
 
+def assert_event_schema_compatible(
+    root: Path, *, supported_event_epoch: int
+) -> None:
+    ledger = Ledger(root)
+    try:
+        required = ledger.event_capability_required()
+    finally:
+        ledger.close()
+    if required and supported_event_epoch != EVENT_CAPABILITY_EPOCH:
+        raise RuntimeError(
+            "bound event reservations require the exact event schema epoch"
+        )
+
+
+def assert_delivery_schema_compatible(
+    root: Path, *, supported_delivery_epoch: int
+) -> None:
+    ledger = Ledger(root)
+    try:
+        required = ledger.delivery_capability_required()
+    finally:
+        ledger.close()
+    if required and supported_delivery_epoch != DELIVERY_CAPABILITY_EPOCH:
+        raise RuntimeError(
+            "nonterminal thread deliveries require the exact delivery schema epoch"
+        )
+
+
+async def assert_delivery_runtime_compatible(
+    root: Path,
+    *,
+    supported_delivery_epoch: int,
+    app_server_factory: Callable[[], Any] | None = None,
+) -> None:
+    """Also refuse downgrade while Core still stores a matching queue pointer."""
+
+    if supported_delivery_epoch == DELIVERY_CAPABILITY_EPOCH:
+        return
+    assert_delivery_schema_compatible(
+        root, supported_delivery_epoch=supported_delivery_epoch
+    )
+    ledger = Ledger(root)
+    try:
+        records = [
+            record
+            for record in ledger.list(include_terminal=True)
+            if record.delivery_kind == DeliveryKind.THREAD
+        ]
+    finally:
+        ledger.close()
+    factory = app_server_factory or (
+        lambda: AppServerClient(
+            codex_home_for_runtime_root(root), experimental_api=True
+        )
+    )
+    for record in records:
+        delivery = record.delivery or {}
+        async with factory() as app_server:
+            observation = await app_server.inspect_thread_delivery(
+                thread_id=str(delivery.get("thread_id", "")),
+                delivery_id=str(delivery.get("delivery_id", "")),
+                expected_pointer_digest=str(delivery.get("pointer_digest", "")),
+            )
+        if int(observation.get("queue_matches", 0)) + int(
+            observation.get("queue_modified", 0)
+        ):
+            raise RuntimeError(
+                "matching queue pointer requires the exact delivery schema epoch"
+            )
+
+
 async def run_daemon(root: Path, *, interval_seconds: float, once: bool = False) -> int:
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
+    assert_event_schema_compatible(
+        root, supported_event_epoch=EVENT_CAPABILITY_EPOCH
+    )
+    assert_delivery_schema_compatible(
+        root, supported_delivery_epoch=DELIVERY_CAPABILITY_EPOCH
+    )
     service = MonitorService(root)
     with DaemonLock(root):
         service.recover_after_daemon_start()
@@ -83,3 +170,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    codex_home_for_runtime_root,

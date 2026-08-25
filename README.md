@@ -1,9 +1,18 @@
 # Codex Wake Me Up
 
-`codex-wake-me-up` is a source-owned, host-local, one-shot monitor for a loaded
-Codex goal. It observes a typed external condition on the same host, records
-durable evidence, and makes at most one guarded
-`thread/goal/set(status: "active")` request.
+`codex-wake-me-up` is a source-owned, host-local, one-shot monitor for one exact
+Codex task. It observes a typed external condition on the same host, records
+durable evidence, and makes at most one delivery attempt through an explicitly
+selected delivery kind.
+
+The primary `wait_for_event` path is goal-independent. Codex binds registration
+to the calling task through trusted MCP metadata. A root caller queues one
+bounded, self-identifying pointer in its own durable FIFO; a spawned V2 subagent
+routes that pointer to its topmost root main-thread. The full wake evidence and
+origin stay in monitor status. The plugin wakes the root only: it never resumes,
+recreates, follows up, or accepts the subagent. `defer_goal_until_event` is the
+optional legacy path for callers that explicitly want to pause and later
+reactivate an eligible goal.
 
 Its purpose is to remove the token cost of waiting. An agent that would
 otherwise poll, sleep, or burn long-yield turns instead arms one monitor and
@@ -27,16 +36,26 @@ ends its turn; the daemon owns the wait.
 
 It is intentionally conservative:
 
-- It never opens a TCP listener, runs a raw shell predicate, starts a new turn,
-  reloads an unloaded task, or targets another host.
-- Continuation is the native guarded goal-status write only. There is no
-  `turn/start`, no `thread/resume`, and no synthetic user message.
+- It never opens a TCP listener, runs a raw shell predicate, targets another
+  host, steers an active turn, or starts a second app-server/Core writer.
+- Thread delivery composes only the experimental per-thread queue plus exact
+  `thread/resume` for a stored unloaded target. It never calls
+  `thread/queue/start`, ordinary `turn/start`, steer, inject, Desktop task
+  messaging, or `codex exec resume`.
+- Primary MCP registration takes its task UUID only from Codex `_meta.threadId`.
+  A spawned V2 caller is resolved through its exact `parentThreadId` chain to
+  the topmost root. The root receives the wake and owns every later decision;
+  no intermediate agent or child turn is started by the plugin.
+- A thread monitor consumes its sole queue-add attempt before transport. Queue
+  ACK, queue presence, durable history recording, and terminal uncertainty are
+  distinct facts. The underlying queue is not exactly-once and the plugin never
+  blindly re-adds after an uncertain response.
 - A receipt with status `success` is the only authoritative task-success
   evidence. Time, GPU utilization, PID exit, tmux exit, log content, and
   another thread's idleness are resource/liveness signals, and continuing a
   goal from them requires `allow_heuristic_continuation: true`.
-- The target must be locally loaded, `idle`, and still own the captured goal
-  immediately before activation. An activation attempt is never retried.
+- Goal delivery still requires the target to be locally loaded, `idle`, and own
+  the captured paused goal immediately before its one activation attempt.
 - At most one durable trigger claim and one activation request per monitor,
   whatever caused the wake.
 - `wake_me_up_defer` is **best effort**: a generic MCP tool receives a supplied
@@ -58,27 +77,176 @@ explicit operator decision. The daemon stores only runtime state under
 
 ## MCP tools
 
-`wake_me_up` captures a target's already-paused goal and arms a monitor:
+`wait_for_event` is the primary operation. It has no model-supplied `thread_id`;
+Codex supplies the exact caller UUID out of band. It works regardless of whether
+the caller's goal is null, active, paused, or blocked:
 
 ```json
 {
-  "thread_id": "<loaded-thread-id>",
   "condition": {"type": "time", "after_seconds": 1800},
   "expires_in_seconds": 7200,
-  "allow_heuristic_continuation": true,
   "idempotency_key": "after-training-idle-v1"
 }
 ```
 
-`wake_me_up_defer` takes the same fields for a loaded **active** goal and runs
-the watcher-first, pause-once flow below. It is a separate tool so existing
-`wake_me_up` callers keep the explicit paused-goal precondition.
+For a spawned V2 subagent, registration records the child as
+`origin_thread_id` and the topmost root as the delivery `thread_id`. When the
+event fires, only the root FIFO is woken. The root inspects status and decides
+whether any child follow-up is useful. The CLI `wait-for-event` command remains
+an explicit same-host targeting surface for operators.
+
+Registration authorizes the later billed task turn and, for a stored unloaded
+target, an unconditional exact-thread resume that can release user-authored FIFO
+items ahead of the monitor pointer. Their identities and count are persisted
+before resume. The pointer itself is small, names the origin task UUID, and tells
+the root to inspect status once; it is not a success claim.
+
+`defer_goal_until_event` takes the same monitor fields plus the legacy heuristic
+authorization for an explicit active or paused goal. `wake_me_up` and
+`wake_me_up_defer` remain compatibility aliases for paused and active goal
+delivery respectively; neither alias creates a goal or selects thread delivery.
 
 `wake_me_up_status` returns the captured guard, evidence, outcome, timestamps,
 and `supervision` (`healthy` or `unsupervised`). `wake_me_up_cancel` cancels a
 registering, armed, or claimed monitor; it cannot undo an activation already
 recorded as `activating`, nor compensate for a possibly delivered pause.
 `wake_me_up_publish_receipt` writes a monitor's receipt atomically.
+
+The MCP request timeout is only a control-call bound. Once registration returns
+an `armed` durable receipt, the detached daemon owns observation and delivery
+until the condition, expiry, cancellation, or a typed failure terminates it.
+Blocking an MCP/CLI call for the whole wait would couple monitor lifetime to a
+client transport and is not a delivery architecture.
+
+## Terminal events and worker delivery
+
+For a command or delegated worker that can publish a bounded terminal event,
+the operator/agent workflow is:
+
+1. Reserve one expiring, single-use event capability before starting the
+   producer.
+2. Hand the publish capability to the existing command wrapper or worker
+   harness. The plugin does not launch commands, execute raw shell predicates,
+   or replace the harness.
+3. Launch the command or worker through that existing harness.
+4. Bind the reservation while registering a monitor (or while performing the
+   existing watcher-first defer). A producer may publish before binding; the
+   reservation retains the event until it is bound or expires.
+5. End the lead's turn after a successful bind/defer. The lead is not billed a
+   continuation merely for reserving or binding; any resulting guarded wake is
+   a real continuation and may spend tokens or other model budget.
+6. The producer may send bounded heartbeats and then publish exactly one
+   terminal event through the handed capability. Publication is producer-owned;
+   it is not a command launched by the plugin.
+7. When the monitor wakes, the lead makes one status call and independently
+   reviews any worker candidate before deciding whether to integrate it.
+
+The frozen producer surfaces are:
+
+- CLI: `event-reserve --payload`, `event-status --reservation-id`,
+  `event-cancel --reservation-id`, `event-heartbeat --payload`, and
+  `event-publish --payload`.
+- MCP: `wake_me_up_event_reserve`, `wake_me_up_event_status`,
+  `wake_me_up_event_cancel`, `wake_me_up_event_heartbeat`, and
+  `wake_me_up_event_publish`.
+
+Reserve, heartbeat, and publish accept only a path to a current-user-owned,
+mode-`0600`, regular JSON file of at most 64 KiB; symlinks are refused. Never
+put a publish token in CLI arguments. A command reserve payload can be as small
+as:
+
+```json
+{
+  "kind": "command_terminal",
+  "expires_in_seconds": 7200,
+  "idempotency_key": "train-command-20260820",
+  "producer_identity": "existing-shell-wrapper",
+  "publisher_descriptor_path": "/private/runtime/train-command.publisher.json"
+}
+```
+
+The first creation response is the only response containing the raw token;
+idempotent replay returns the same reservation identity and fingerprint but
+cannot reissue the bearer. Capture the first response or use the optional
+mode-`0600` publisher descriptor. A heartbeat/publish payload wraps that
+capability rather than passing it on the command line:
+
+```json
+{
+  "reservation_id": "<reservation-id>",
+  "publish_token": "<publish-token>",
+  "terminal_event": {
+    "kind": "command_terminal",
+    "status": "succeeded",
+    "command_label": "focused-test",
+    "command_digest": "<64-lowercase-hex>",
+    "exit_code": 0
+  }
+}
+```
+
+Native subagents and HarnessDock workers use the same `worker_terminal`
+envelope through `publish_worker_terminal_from_descriptor`; this is a narrow
+publisher adapter, not another watcher, callback scheduler, or wake claimant.
+
+`command_terminal` and `worker_terminal` are distinct condition leaves and
+claims:
+
+- A `command_terminal` event reports one command outcome: `succeeded`,
+  `failed`, `cancelled`, or `signaled`, with bounded execution evidence. Even
+  exit code 0 proves only that bounded command process outcome.
+- A `worker_terminal` event reports `delivered`, `blocked`, `failed`, or
+  `cancelled`. `delivered` names one candidate commit and receives read-only
+  attestation against the reservation's repository, worktree, baseline, and
+  allowed paths. The candidate is a delivery for independent lead review, not
+  acceptance. In particular, `git commit` exit 0 is not delivery acceptance.
+
+Every command terminal outcome wakes when bound, including succeeded, failed,
+cancelled, and signaled. Every worker terminal outcome also wakes when bound,
+including blocked, failed, cancelled, and a delivered event whose candidate is
+missing, baseline-
+mismatched, out of scope, or otherwise has an invalid/error attestation. An
+invalid delivery must wake the lead so it can handle the evidence; it must not
+be silently converted to success or stranded until expiry. The plugin never
+reviews, stages, commits, merges, cherry-picks, reverts, pushes, or watches Git
+refs, worktrees, or unrelated commits.
+
+Heartbeats are bounded liveness hints, not progress turns. `heartbeat_stale`
+is heuristic: it says that accepted heartbeats stopped advancing under the
+declared contract, not that the producer failed. It is false after terminal
+publication and unknown when the required initial heartbeat or reservation
+identity is unavailable. Apply the existing heuristic authorization policy to
+it.
+
+After the lead wakes, make exactly one status call for the monitor. It carries
+the terminal outcome, producer identity, candidate and bounded attestation (if
+any), heartbeat summary, and an explicit not-accepted marker. The lead then
+independently reviews the candidate and decides whether any integration is
+warranted. A terminal event authorizes the guarded wake, not task success,
+lead acceptance, or user acceptance.
+
+Cancellation or expiry of an unbound reservation is terminal and prevents
+later binding or publication; a bound reservation remains bound and is never
+reassigned after monitor cancellation, expiry, pause failure, or activation
+failure. Event and monitor lifecycle still converge on one durable trigger
+claim and at most one guarded wake attempt per monitor, with no retry or
+automatic re-arm. The existing cancellation, expiry, fail-closed, and legacy
+`receipt_success`/defer rules remain in force.
+
+Publish tokens and raw command arguments are never placed in status or logs;
+use bounded, redacted evidence and token fingerprints only. Cancellation,
+expiry, and daemon restart are recovery boundaries, not permission to reuse a
+capability or publish a second terminal event.
+
+No install, plugin cutover, daemon restart, live app-server smoke, paid/live
+continuation, or material command/worker/model spend is implied by this
+documentation. Those actions require their existing explicit operator
+authorization and verification boundaries.
+
+Rollback is producer-side: stop creating or publishing terminal-event
+reservations and keep using the legacy monitor conditions. Existing legacy
+rows remain readable and functional; the additive event ledger is retained for
+forensic inspection and must not be deleted during rollback.
 
 ## Conditions
 
@@ -103,6 +271,12 @@ All conditions are typed objects, combined with `all` or `any`.
 For tmux the monitor captures the original server PID and pane/session ID; a
 missing or restarted server is `unknown`, not completion. For PIDs it captures
 the boot ID, start time, and UID, so PID reuse or a reboot is also `unknown`.
+The same captured process in Linux state `Z`, `X`, or `x` is terminated even
+while its `/proc` record awaits reaping; registration rejects a PID that is
+already terminal. PID and tmux leaves remain liveness evidence, never task
+success. Pass the tmux socket explicitly: the environment fallback belongs to
+the registering service, and a dead pane that remains addressable is not a
+satisfied `tmux_exit` target-removal condition.
 
 ### `log_pattern`
 
@@ -165,6 +339,11 @@ its response. A job wrapper publishes one atomically:
 codex-wake-me-up receipt --monitor-id <id> --token <token> --status success
 ```
 
+This receipt is monitor-bound. An ordinary producer JSON that happens to carry
+`exit_code: 0` is not visible to `receipt_success`; use a pre-reserved
+`command_terminal` event, or observe that ordinary file with `log_pattern`
+including both success and failure signatures.
+
 `any(receipt_success, time)` does not bypass the heuristic policy. For a legacy
 monitor a time-only witness ends as `satisfied_requires_authorization` unless
 the operator opted in; for a deferred monitor the same witness wakes through
@@ -180,7 +359,12 @@ request:
 ```json
 {
   "thread_id": "<current-loaded-thread-id>",
-  "condition": {"type": "tmux_exit", "target_kind": "pane", "target": "%12"},
+  "condition": {
+    "type": "tmux_exit",
+    "target_kind": "pane",
+    "target": "%12",
+    "socket": "/tmp/tmux-1000/default"
+  },
   "expires_in_seconds": 14400,
   "allow_heuristic_continuation": true,
   "idempotency_key": "training-pane-defer-v1"
@@ -288,7 +472,36 @@ previous commit, (2) restore the previous version string, (3) reinstall,
 (4) restart the lock-holding daemon. Terminal monitor rows are forensic
 evidence and are never replayed, so no ledger rollback is required.
 
+Before step (1), run the compatibility preflight from the still-current source:
+
+```bash
+codex-wake-me-up event-compatibility-check --supported-event-epoch 0
+```
+
+Replace `0` with the target source's declared epoch. The check refuses while a
+nonterminal event monitor still requires the current evaluator, even if its
+reservation row is missing or corrupt. Readiness separately requires Linux to
+report the heartbeat PID as the kernel owner of `daemon.lock`; a matching PID
+written into the file is insufficient. An older binary cannot contain a guard
+added by this version, so running the preflight before source/cache replacement
+is mandatory; completed event history does not block rollback and the additive
+event table remains intact.
+
 ## Known limits
+
+- **Thread queue delivery is not exactly-once.** Core can lose a pointer after
+  queue deletion but before durable history, or replay it around a dispatch-time
+  crash. The stable delivery ID makes duplicates refer to one immutable monitor;
+  history then queue then 60 seconds of online absence reconciliation produces
+  `recorded`, `delivery_modified`, or truthful `delivery_uncertain`. User delete,
+  crash, archive, and storage loss can remain observationally indistinguishable.
+- **The queue is shared user state.** Its observed capacity is 100. Existing
+  items retain FIFO priority; users can edit, reorder, or delete the pointer; an
+  interrupted task can stall dispatch indefinitely. The plugin reports those
+  facts and never restores user text or promises a delivery deadline.
+- **Stored-target resume can spend model budget.** Explicit thread registration
+  authorizes exact-thread FIFO release. Resume may start user-authored items ahead
+  of the pointer and cascade until the queue drains or a turn interrupts.
 
 - **Read-to-write race.** The app-server protocol has no expected-goal
   compare-and-set. If a user replaces the goal after preflight but before the

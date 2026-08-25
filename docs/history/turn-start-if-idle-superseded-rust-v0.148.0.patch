@@ -1,0 +1,737 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index 3893b7762..29d9b5383 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -921,6 +921,11 @@ client_request_definitions! {
+         serialization: thread_id(params.thread_id),
+         response: v2::TurnStartResponse,
+     },
++    TurnStartIfIdle => "turn/startIfIdle" {
++        params: v2::TurnStartIfIdleParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::TurnStartIfIdleResponse,
++    },
+     TurnSteer => "turn/steer" {
+         params: v2::TurnSteerParams,
+         inspect_params: true,
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/turn.rs b/codex-rs/app-server-protocol/src/protocol/v2/turn.rs
+index 0b2c092ec..b5da4f372 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/turn.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/turn.rs
+@@ -167,6 +167,45 @@ pub struct TurnStartResponse {
+     pub turn: Turn,
+ }
+
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct TurnStartIfIdleParams {
++    pub thread_id: String,
++    pub expected_last_turn_id: String,
++    #[ts(optional = nullable)]
++    pub client_user_message_id: Option<String>,
++    pub input: Vec<UserInput>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum TurnStartIfIdleRejectionReason {
++    ThreadNotLoaded,
++    ThreadBusy,
++    NoVisibleTurn,
++    LatestTurnNotCompleted,
++    LatestTurnMismatch,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(tag = "status", rename_all = "camelCase")]
++#[ts(tag = "status", rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum TurnStartIfIdleResponse {
++    Admitted {
++        turn: Turn,
++    },
++    Rejected {
++        reason: TurnStartIfIdleRejectionReason,
++        #[serde(rename = "actualLastTurnId")]
++        #[ts(rename = "actualLastTurnId")]
++        actual_last_turn_id: Option<String>,
++    },
++}
++
+ #[derive(
+     Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
+ )]
+diff --git a/codex-rs/app-server/README.md b/codex-rs/app-server/README.md
+index a9cbbe3d3..8ea8847ad 100644
+--- a/codex-rs/app-server/README.md
++++ b/codex-rs/app-server/README.md
+@@ -207,6 +207,7 @@ Example with notification opt-out:
+ - `thread/rollback` — deprecated and will be removed soon. Drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success. Paginated threads do not support rollback.
+ - `thread/revert` — experimental. Replace a loaded paginated thread's durable history with the prefix strictly before `beforeTurnId` while preserving its thread id. The operation interrupts an active turn if needed, leaves older rollout files immutable, reloads the thread, returns updated thread metadata with empty `turns` plus pagination cursors, and emits `thread/reverted`. It does not revert local file changes.
+ - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` supplies the default roots for newly resolved environment selections. Explicit `environments[].runtimeWorkspaceRoots` override that fallback with environment-native absolute paths. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode". Deprecated experimental `multiAgentMode` is ignored; Ultra reasoning effort selects proactive behavior.
++- `turn/startIfIdle` — atomically start a turn only when the exact thread is loaded and idle and its latest visible turn is completed with an id equal to `expectedLastTurnId`. The request accepts bounded `input` and optional `clientUserMessageId`, but no settings overrides. It returns a tagged `admitted` or `rejected` result; rejection never steers, queues, records the input, or starts model or memory work.
+ - `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success.
+ - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`.
+ - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
+@@ -952,6 +953,38 @@ Models in `required_on_models` use `approvalsReviewer: "auto_review"` while pres
+ } } }
+ ```
+
++### Example: Atomically start a guarded idle turn
++
++Use `turn/startIfIdle` for a detached producer that must not overwrite or steer
++newer thread activity. `expectedLastTurnId` must identify the latest visible
++turn and that turn must have completed successfully. Rejections return one of
++`threadNotLoaded`, `threadBusy`, `noVisibleTurn`, `latestTurnNotCompleted`, or
++`latestTurnMismatch`. `actualLastTurnId` is non-null when the server can safely
++identify the latest visible turn.
++
++```json
++{ "method": "turn/startIfIdle", "id": 31, "params": {
++    "threadId": "thr_123",
++    "expectedLastTurnId": "turn_456",
++    "clientUserMessageId": "monitor_delivery_123",
++    "input": [ { "type": "text", "text": "The registered monitor fired." } ]
++} }
++{ "id": 31, "result": {
++    "status": "admitted",
++    "turn": { "id": "turn_457", "status": "inProgress", "items": [], "error": null }
++} }
++```
++
++A stale request is conclusive and does not submit its input:
++
++```json
++{ "id": 31, "result": {
++    "status": "rejected",
++    "reason": "latestTurnMismatch",
++    "actualLastTurnId": "turn_999"
++} }
++```
++
+ ### Example: Start a turn (invoke a skill)
+
+ Invoke a skill explicitly by including `$<skill-name>` in the text input and adding a `skill` input item alongside it.
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index d02be3412..c4f35b095 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1371,6 +1371,11 @@ impl MessageProcessor {
+                     )
+                     .await
+             }
++            ClientRequest::TurnStartIfIdle { params, .. } => {
++                self.turn_processor
++                    .turn_start_if_idle(request_id.clone(), params)
++                    .await
++            }
+             ClientRequest::ThreadInjectItems { params, .. } => {
+                 self.turn_processor.thread_inject_items(params).await
+             }
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 0929e2629..1c175443d 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -297,6 +297,9 @@ use codex_app_server_protocol::TurnError;
+ use codex_app_server_protocol::TurnInterruptParams;
+ use codex_app_server_protocol::TurnInterruptResponse;
+ use codex_app_server_protocol::TurnItemsView;
++use codex_app_server_protocol::TurnStartIfIdleParams;
++use codex_app_server_protocol::TurnStartIfIdleRejectionReason;
++use codex_app_server_protocol::TurnStartIfIdleResponse;
+ use codex_app_server_protocol::TurnStartParams;
+ use codex_app_server_protocol::TurnStartResponse;
+ use codex_app_server_protocol::TurnStatus;
+@@ -333,6 +336,8 @@ use codex_connectors::AppInfo;
+ use codex_core::CodexThread;
+ use codex_core::CodexThreadSettingsOverrides;
+ use codex_core::ForkSnapshot;
++use codex_core::GuardedStartIfIdleRejection;
++use codex_core::GuardedStartIfIdleSubmission;
+ use codex_core::McpManager;
+ use codex_core::NewThread;
+ use codex_core::NotSubmittedReason;
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+index 08de04ffb..f9bb9d6cc 100644
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -192,6 +192,114 @@ impl TurnRequestProcessor {
+         .map(|response| Some(response.into()))
+     }
+
++    pub(crate) async fn turn_start_if_idle(
++        &self,
++        request_id: ConnectionRequestId,
++        params: TurnStartIfIdleParams,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        validate_user_input_image_urls(&params.input)?;
++        if params.input.is_empty() {
++            return Err(invalid_request("input must not be empty"));
++        }
++        if params.expected_last_turn_id.is_empty() {
++            return Err(invalid_request("expectedLastTurnId must not be empty"));
++        }
++        if let Err(error) = Self::validate_v2_input_limit(&params.input) {
++            self.track_error_response(
++                &request_id,
++                &error,
++                Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
++            );
++            return Err(error);
++        }
++
++        let thread_id = ThreadId::from_string(&params.thread_id)
++            .map_err(|error| invalid_request(format!("invalid thread id: {error}")))?;
++        let thread = match self.thread_manager.get_thread(thread_id).await {
++            Ok(thread) => thread,
++            Err(_) => {
++                return Ok(Some(
++                    TurnStartIfIdleResponse::Rejected {
++                        reason: TurnStartIfIdleRejectionReason::ThreadNotLoaded,
++                        actual_last_turn_id: None,
++                    }
++                    .into(),
++                ));
++            }
++        };
++        self.ensure_direct_input_allowed(&request_id, thread.as_ref())
++            .await?;
++        let input = params
++            .input
++            .into_iter()
++            .map(V2UserInput::into_core)
++            .collect();
++        let submission = thread
++            .start_turn_if_idle_at(
++                TurnInputRequest::new(TurnInput::UserInput {
++                    content: input,
++                    client_id: params.client_user_message_id,
++                })
++                .with_trace(self.request_trace_context(&request_id).await),
++                &params.expected_last_turn_id,
++            )
++            .await
++            .map_err(|error| {
++                let error = internal_error(format!("failed to submit guarded turn input: {error}"));
++                self.track_error_response(&request_id, &error, /*error_type*/ None);
++                error
++            })?;
++        let response = match submission {
++            GuardedStartIfIdleSubmission::Started { turn_id } => {
++                self.outgoing
++                    .record_request_turn_id(&request_id, &turn_id)
++                    .await;
++                TurnStartIfIdleResponse::Admitted {
++                    turn: Turn {
++                        id: turn_id,
++                        items: Vec::new(),
++                        items_view: TurnItemsView::NotLoaded,
++                        error: None,
++                        status: TurnStatus::InProgress,
++                        started_at: None,
++                        completed_at: None,
++                        duration_ms: None,
++                    },
++                }
++            }
++            GuardedStartIfIdleSubmission::NotSubmitted {
++                reason: NotSubmittedReason::NotIdle | NotSubmittedReason::PendingTriggerTurn,
++            } => TurnStartIfIdleResponse::Rejected {
++                reason: TurnStartIfIdleRejectionReason::ThreadBusy,
++                actual_last_turn_id: None,
++            },
++            GuardedStartIfIdleSubmission::NotSubmitted { reason } => {
++                return Err(internal_error(format!(
++                    "unexpected guarded turn rejection: {reason:?}"
++                )));
++            }
++            GuardedStartIfIdleSubmission::Rejected { reason } => match reason {
++                GuardedStartIfIdleRejection::NoVisibleTurn => TurnStartIfIdleResponse::Rejected {
++                    reason: TurnStartIfIdleRejectionReason::NoVisibleTurn,
++                    actual_last_turn_id: None,
++                },
++                GuardedStartIfIdleRejection::LatestTurnNotCompleted {
++                    actual_last_turn_id,
++                } => TurnStartIfIdleResponse::Rejected {
++                    reason: TurnStartIfIdleRejectionReason::LatestTurnNotCompleted,
++                    actual_last_turn_id: Some(actual_last_turn_id),
++                },
++                GuardedStartIfIdleRejection::LatestTurnMismatch {
++                    actual_last_turn_id,
++                } => TurnStartIfIdleResponse::Rejected {
++                    reason: TurnStartIfIdleRejectionReason::LatestTurnMismatch,
++                    actual_last_turn_id: Some(actual_last_turn_id),
++                },
++            },
++        };
++        Ok(Some(response.into()))
++    }
++
+     pub(crate) async fn thread_inject_items(
+         &self,
+         params: ThreadInjectItemsParams,
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+index 553819b7d..4b77917d6 100644
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -105,6 +105,7 @@ mod thread_unarchive;
+ mod thread_unsubscribe;
+ mod turn_interrupt;
+ mod turn_start;
++mod turn_start_if_idle;
+ mod turn_start_zsh_fork;
+ mod turn_steer;
+ mod view_image;
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index cdc8c0132..82ed38282 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -42,6 +42,7 @@ use codex_protocol::protocol::TokenUsageInfo;
+ use codex_protocol::protocol::TurnEnvironmentSelection;
+ use codex_protocol::protocol::TurnEnvironmentSelections;
+ use codex_protocol::protocol::W3cTraceContext;
++use codex_protocol::turn_input::NotSubmittedReason;
+ use codex_protocol::turn_input::RecoverTurnRequest;
+ use codex_protocol::turn_input::StartIfIdleSubmission;
+ use codex_protocol::turn_input::SteerSubmission;
+@@ -173,6 +174,20 @@ pub struct CodexThread {
+     _diagnostics_guard: GaugeGuard,
+ }
+
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum GuardedStartIfIdleRejection {
++    NoVisibleTurn,
++    LatestTurnNotCompleted { actual_last_turn_id: String },
++    LatestTurnMismatch { actual_last_turn_id: String },
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum GuardedStartIfIdleSubmission {
++    Started { turn_id: String },
++    NotSubmitted { reason: NotSubmittedReason },
++    Rejected { reason: GuardedStartIfIdleRejection },
++}
++
+ #[derive(Default)]
+ struct OutOfBandElicitations {
+     count: i64,
+@@ -312,6 +327,27 @@ impl CodexThread {
+         }
+     }
+
++    /// Starts a regular turn only when the thread is idle and its latest
++    /// visible turn is the expected completed turn.
++    ///
++    /// Core validates the turn guard while holding the same active-turn lock
++    /// that reserves the idle slot, so rejection cannot record or enqueue the
++    /// supplied input.
++    pub async fn start_turn_if_idle_at(
++        &self,
++        request: TurnInputRequest,
++        expected_last_turn_id: &str,
++    ) -> CodexResult<GuardedStartIfIdleSubmission> {
++        self.session
++            .services
++            .agent_control
++            .ensure_execution_capacity_for_turn_start(self)
++            .await?;
++        self.session
++            .start_turn_if_idle_at(request, expected_last_turn_id)
++            .await
++    }
++
+     /// Resumes an interrupted regular turn only when the thread is idle.
+     ///
+     /// Recovery starts no new user input and preserves the turn ID that was
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index e8335a448..373905686 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -35,6 +35,8 @@ pub use codex_protocol::protocol::EnvironmentConfig;
+ pub use codex_thread::BackgroundTerminalInfo;
+ pub use codex_thread::CodexThread;
+ pub use codex_thread::CodexThreadSettingsOverrides;
++pub use codex_thread::GuardedStartIfIdleRejection;
++pub use codex_thread::GuardedStartIfIdleSubmission;
+ pub use codex_thread::ThreadConfigSnapshot;
+ pub use session::turn_context::TurnContext;
+ mod agent;
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 33b77fadf..74b97fce1 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1008,6 +1008,15 @@ fn push_prompt_fragment(
+ }
+
+ impl Session {
++    pub(crate) async fn start_turn_if_idle_at(
++        self: &Arc<Self>,
++        request: TurnInputRequest,
++        expected_last_turn_id: &str,
++    ) -> CodexResult<crate::GuardedStartIfIdleSubmission> {
++        turn_input::start_if_idle_at(self, request, new_submission_id(), expected_last_turn_id)
++            .await
++    }
++
+     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
+         let state = self.state.lock().await;
+         AppServerClientMetadata {
+diff --git a/codex-rs/core/src/session/turn_input.rs b/codex-rs/core/src/session/turn_input.rs
+index 90e456025..e17bc58ca 100644
+--- a/codex-rs/core/src/session/turn_input.rs
++++ b/codex-rs/core/src/session/turn_input.rs
+@@ -13,10 +13,14 @@ use super::session::Session;
+ use super::session::SessionSettingsUpdate;
+ use super::thread_settings;
+ use super::turn_context::TurnContext;
++use crate::GuardedStartIfIdleRejection;
++use crate::GuardedStartIfIdleSubmission;
+ use crate::state::ActiveTurn;
+ use crate::state::TurnState;
+ use crate::tasks::MailboxParentProvenance;
+ use crate::tasks::RegularTask;
++use codex_app_server_protocol::TurnStatus;
++use codex_app_server_protocol::build_turns_from_rollout_items;
+ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::Result as CodexResult;
+@@ -255,17 +259,8 @@ async fn start_if_idle(
+     submission_id: String,
+     is_recovery: bool,
+ ) -> CodexResult<TurnInputSubmission> {
+-    let TurnInputRequest {
+-        input,
+-        thread_settings,
+-        start,
+-        additional_context,
+-        responsesapi_client_metadata,
+-        ..
+-    } = request;
+-    let has_user_input = has_nonempty_user_input(&input);
++    let has_user_input = has_nonempty_user_input(&request.input);
+     let is_automatic_idle_work = !has_user_input && !is_recovery;
+-    let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
+     if session.input_queue.has_trigger_turn_mailbox_items().await {
+         return Ok(TurnInputSubmission::NotSubmitted {
+             reason: NotSubmittedReason::PendingTriggerTurn,
+@@ -290,6 +285,28 @@ async fn start_if_idle(
+         Arc::clone(&active_turn.turn_state)
+     };
+
++    finish_start_if_idle(session, request, submission_id, is_recovery, turn_state).await
++}
++
++async fn finish_start_if_idle(
++    session: &Arc<Session>,
++    request: TurnInputRequest,
++    submission_id: String,
++    is_recovery: bool,
++    turn_state: Arc<tokio::sync::Mutex<TurnState>>,
++) -> CodexResult<TurnInputSubmission> {
++    let TurnInputRequest {
++        input,
++        thread_settings,
++        start,
++        additional_context,
++        responsesapi_client_metadata,
++        ..
++    } = request;
++    let has_user_input = has_nonempty_user_input(&input);
++    let is_automatic_idle_work = !has_user_input && !is_recovery;
++    let can_start_root_turn = start.parent_turn_id.is_none() && start.root_turn_id.is_none();
++
+     if session.input_queue.has_trigger_turn_mailbox_items().await {
+         session.clear_reserved_idle_turn(&turn_state).await;
+         session.maybe_start_turn_for_pending_work().await;
+@@ -371,6 +388,81 @@ async fn start_if_idle(
+     })
+ }
+
++pub(super) async fn start_if_idle_at(
++    session: &Arc<Session>,
++    request: TurnInputRequest,
++    submission_id: String,
++    expected_last_turn_id: &str,
++) -> CodexResult<GuardedStartIfIdleSubmission> {
++    if session.input_queue.has_trigger_turn_mailbox_items().await {
++        return Ok(GuardedStartIfIdleSubmission::NotSubmitted {
++            reason: NotSubmittedReason::PendingTriggerTurn,
++        });
++    }
++
++    let turn_state = {
++        let mut active_turn = session.active_turn.lock().await;
++        if active_turn.is_some() {
++            return Ok(GuardedStartIfIdleSubmission::NotSubmitted {
++                reason: NotSubmittedReason::NotIdle,
++            });
++        }
++        let live_thread = session
++            .live_thread_for_persistence("guarded turn start")
++            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
++        let stored_thread = live_thread
++            .read_thread(
++                /*include_archived*/ true, /*include_history*/ true,
++            )
++            .await
++            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
++        let latest_turn = stored_thread
++            .history
++            .as_ref()
++            .and_then(|history| build_turns_from_rollout_items(&history.items).pop());
++        let Some(latest_turn) = latest_turn else {
++            return Ok(GuardedStartIfIdleSubmission::Rejected {
++                reason: GuardedStartIfIdleRejection::NoVisibleTurn,
++            });
++        };
++        if latest_turn.status != TurnStatus::Completed {
++            return Ok(GuardedStartIfIdleSubmission::Rejected {
++                reason: GuardedStartIfIdleRejection::LatestTurnNotCompleted {
++                    actual_last_turn_id: latest_turn.id,
++                },
++            });
++        }
++        if latest_turn.id != expected_last_turn_id {
++            return Ok(GuardedStartIfIdleSubmission::Rejected {
++                reason: GuardedStartIfIdleRejection::LatestTurnMismatch {
++                    actual_last_turn_id: latest_turn.id,
++                },
++            });
++        }
++        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
++        Arc::clone(&active_turn.turn_state)
++    };
++    match finish_start_if_idle(
++        session,
++        request,
++        submission_id,
++        /*is_recovery*/ false,
++        turn_state,
++    )
++    .await?
++    {
++        TurnInputSubmission::Started { turn_id } => {
++            Ok(GuardedStartIfIdleSubmission::Started { turn_id })
++        }
++        TurnInputSubmission::NotSubmitted { reason } => {
++            Ok(GuardedStartIfIdleSubmission::NotSubmitted { reason })
++        }
++        TurnInputSubmission::Steered { .. } => {
++            unreachable!("guarded start-if-idle submission cannot steer")
++        }
++    }
++}
++
+ async fn steer(
+     session: &Arc<Session>,
+     request: TurnInputRequest,
+diff --git a/codex-rs/app-server/tests/suite/v2/turn_start_if_idle.rs b/codex-rs/app-server/tests/suite/v2/turn_start_if_idle.rs
+new file mode 100644
+index 000000000..46285f239
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/turn_start_if_idle.rs
+@@ -0,0 +1,201 @@
++use anyhow::Result;
++use app_test_support::MockResponsesConfig;
++use app_test_support::TestAppServer;
++use app_test_support::create_final_assistant_message_sse_response;
++use app_test_support::create_mock_responses_server_sequence_unchecked;
++use codex_app_server_protocol::ThreadSource;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadStartResponse;
++use codex_app_server_protocol::TurnStartParams;
++use codex_app_server_protocol::UserInput;
++use core_test_support::responses;
++use core_test_support::streaming_sse::StreamingSseChunk;
++use core_test_support::streaming_sse::start_streaming_sse_server;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use std::time::Duration;
++use tempfile::TempDir;
++use tokio::sync::oneshot;
++use tokio::time::timeout;
++use wiremock::MockServer;
++
++const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
++
++fn turn_start_params(thread_id: &str, text: &str) -> TurnStartParams {
++    TurnStartParams {
++        thread_id: thread_id.to_string(),
++        client_user_message_id: None,
++        input: vec![UserInput::Text {
++            text: text.to_string(),
++            text_elements: Vec::new(),
++        }],
++        ..Default::default()
++    }
++}
++
++async fn start_thread(mcp: &mut TestAppServer) -> Result<String> {
++    let ThreadStartResponse { thread, .. } = mcp
++        .start_thread(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            thread_source: Some(ThreadSource::User),
++            ..Default::default()
++        })
++        .await?;
++    Ok(thread.id)
++}
++
++async fn start_if_idle(
++    mcp: &mut TestAppServer,
++    thread_id: &str,
++    expected_last_turn_id: &str,
++    text: &str,
++) -> Result<Value> {
++    let request_id = mcp
++        .send_raw_request(
++            "turn/startIfIdle",
++            Some(json!({
++                "threadId": thread_id,
++                "expectedLastTurnId": expected_last_turn_id,
++                "input": [{ "type": "text", "text": text, "textElements": [] }]
++            })),
++        )
++        .await?;
++    timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await?
++}
++
++async fn completed_thread(
++    include_guarded_response: bool,
++) -> Result<(MockServer, TempDir, TestAppServer, String, String)> {
++    let mut responses = vec![create_final_assistant_message_sse_response(
++        "first complete",
++    )?];
++    if include_guarded_response {
++        responses.push(create_final_assistant_message_sse_response(
++            "guarded complete",
++        )?);
++    }
++    let server = create_mock_responses_server_sequence_unchecked(responses).await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .build_initialized()
++        .await?;
++    let thread_id = start_thread(&mut mcp).await?;
++    let completed = mcp
++        .start_turn_and_wait_for_completion(turn_start_params(&thread_id, "first"))
++        .await?;
++    Ok((server, codex_home, mcp, thread_id, completed.turn.id))
++}
++
++#[tokio::test]
++async fn turn_start_if_idle_starts_when_latest_completed_turn_matches() -> Result<()> {
++    let (server, _codex_home, mut mcp, thread_id, last_turn_id) =
++        completed_thread(/*include_guarded_response*/ true).await?;
++
++    let response = start_if_idle(&mut mcp, &thread_id, &last_turn_id, "monitor result").await?;
++
++    assert_eq!(response["status"], "admitted");
++    assert_eq!(response["turn"]["status"], "inProgress");
++    assert!(
++        response["turn"]["id"]
++            .as_str()
++            .is_some_and(|id| !id.is_empty())
++    );
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("turn/completed"),
++    )
++    .await??;
++    assert_eq!(server.received_requests().await?.len(), 2);
++    Ok(())
++}
++
++#[tokio::test]
++async fn turn_start_if_idle_rejects_stale_guard_without_provider_or_turn_side_effects() -> Result<()>
++{
++    let (server, _codex_home, mut mcp, thread_id, last_turn_id) =
++        completed_thread(/*include_guarded_response*/ false).await?;
++
++    let response = start_if_idle(&mut mcp, &thread_id, "stale-turn", "must not submit").await?;
++
++    assert_eq!(
++        response,
++        json!({
++            "status": "rejected",
++            "reason": "latestTurnMismatch",
++            "actualLastTurnId": last_turn_id,
++        })
++    );
++    assert_eq!(server.received_requests().await?.len(), 1);
++    Ok(())
++}
++
++#[tokio::test]
++async fn turn_start_if_idle_rejects_busy_thread_without_steering_or_queueing() -> Result<()> {
++    let (release_response, response_gate) = oneshot::channel();
++    let (server, _completions) = start_streaming_sse_server(vec![
++        vec![StreamingSseChunk {
++            gate: None,
++            body: responses::sse(vec![
++                responses::ev_response_created("resp-1"),
++                responses::ev_completed("resp-1"),
++            ]),
++        }],
++        vec![
++            StreamingSseChunk {
++                gate: None,
++                body: responses::sse(vec![responses::ev_response_created("resp-2")]),
++            },
++            StreamingSseChunk {
++                gate: Some(response_gate),
++                body: responses::sse(vec![responses::ev_completed("resp-2")]),
++            },
++        ],
++    ])
++    .await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .build_initialized()
++        .await?;
++    let thread_id = start_thread(&mut mcp).await?;
++    let completed = mcp
++        .start_turn_and_wait_for_completion(turn_start_params(&thread_id, "first"))
++        .await?;
++    let active_request_id = mcp
++        .send_turn_start_request(turn_start_params(&thread_id, "active"))
++        .await?;
++    let _: Value = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(active_request_id)).await??;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("turn/started"),
++    )
++    .await??;
++
++    let response =
++        start_if_idle(&mut mcp, &thread_id, &completed.turn.id, "must not steer").await?;
++
++    assert_eq!(
++        response,
++        json!({
++            "status": "rejected",
++            "reason": "threadBusy",
++            "actualLastTurnId": null,
++        })
++    );
++    assert_eq!(server.requests().await.len(), 2);
++    release_response
++        .send(())
++        .expect("active response gate should remain open");
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("turn/completed"),
++    )
++    .await??;
++    tokio::task::yield_now().await;
++    assert_eq!(server.requests().await.len(), 2);
++    Ok(())
++}

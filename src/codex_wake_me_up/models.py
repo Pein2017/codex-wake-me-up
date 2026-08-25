@@ -21,8 +21,18 @@ class MonitorState(StrEnum):
     PAUSING = "pausing"
     ARMED = "armed"
     CLAIMED = "claimed"
+    ADMISSION_IN_PROGRESS = "admission_in_progress"
+    QUEUE_ACCEPTED = "queue_accepted"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCELLATION_IN_PROGRESS = "cancellation_in_progress"
     ACTIVATING = "activating"
     FIRED = "fired"
+    RECORDED = "recorded"
+    DELIVERY_REJECTED = "delivery_rejected"
+    DELIVERY_UNCERTAIN = "delivery_uncertain"
+    DELIVERY_MODIFIED = "delivery_modified"
+    DELIVERY_CAPABILITY_UNAVAILABLE = "delivery_capability_unavailable"
+    CANCELLATION_TOO_LATE = "cancellation_too_late"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
@@ -60,6 +70,12 @@ class WakeReason(StrEnum):
 TERMINAL_STATES = frozenset(
     {
         MonitorState.FIRED,
+        MonitorState.RECORDED,
+        MonitorState.DELIVERY_REJECTED,
+        MonitorState.DELIVERY_UNCERTAIN,
+        MonitorState.DELIVERY_MODIFIED,
+        MonitorState.DELIVERY_CAPABILITY_UNAVAILABLE,
+        MonitorState.CANCELLATION_TOO_LATE,
         MonitorState.CANCELLED,
         MonitorState.EXPIRED,
         MonitorState.SUPERSEDED,
@@ -92,6 +108,10 @@ class ConflictError(WakeMeUpError):
 
 class AppServerError(WakeMeUpError):
     """The local Codex app-server could not provide a conclusive response."""
+
+
+class AppServerRejectedError(AppServerError):
+    """The app-server conclusively rejected a validly transported request."""
 
 
 @dataclass(frozen=True)

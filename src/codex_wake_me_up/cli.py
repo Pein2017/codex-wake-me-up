@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .app_server import AppServerClient
-from .daemon import DaemonLock, main as daemon_main
+from .daemon import (
+    DaemonLock,
+    assert_delivery_runtime_compatible,
+    assert_event_schema_compatible,
+    main as daemon_main,
+)
+from .payloads import load_private_json_payload
 from .runtime import codex_home_for_runtime_root, runtime_root
 from .service import MonitorService
 
@@ -52,6 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list", help="list durable monitor state")
 
+    wait = subparsers.add_parser(
+        "wait-for-event", help="arm ThreadDelivery from a private JSON payload"
+    )
+    wait.add_argument("--payload", type=Path, required=True)
+    defer = subparsers.add_parser(
+        "defer-goal-until-event",
+        help="arm explicit legacy GoalDelivery from a private JSON payload",
+    )
+    defer.add_argument("--payload", type=Path, required=True)
+    status = subparsers.add_parser("status", help="inspect one monitor")
+    status.add_argument("--monitor-id", required=True)
+    cancel = subparsers.add_parser("cancel", help="cancel one monitor")
+    cancel.add_argument("--monitor-id", required=True)
+
     reconcile = subparsers.add_parser("reconcile", help="run one monitor evaluation pass")
     reconcile.add_argument(
         "--unsafe-with-daemon",
@@ -63,6 +83,39 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument("--monitor-id", required=True)
     receipt.add_argument("--token", required=True)
     receipt.add_argument("--status", choices=("success", "failed"), required=True)
+
+    event_reserve = subparsers.add_parser(
+        "event-reserve", help="reserve one terminal event from a private JSON payload"
+    )
+    event_reserve.add_argument("--payload", type=Path, required=True)
+    event_status = subparsers.add_parser(
+        "event-status", help="inspect one redacted event reservation"
+    )
+    event_status.add_argument("--reservation-id", required=True)
+    event_cancel = subparsers.add_parser(
+        "event-cancel", help="cancel one unbound event reservation"
+    )
+    event_cancel.add_argument("--reservation-id", required=True)
+    event_heartbeat = subparsers.add_parser(
+        "event-heartbeat", help="publish a heartbeat from a private JSON payload"
+    )
+    event_heartbeat.add_argument("--payload", type=Path, required=True)
+    event_publish = subparsers.add_parser(
+        "event-publish", help="publish a terminal event from a private JSON payload"
+    )
+    event_publish.add_argument("--payload", type=Path, required=True)
+    compatibility = subparsers.add_parser(
+        "event-compatibility-check",
+        help="preflight a target daemon epoch before replacing current source",
+    )
+    compatibility.add_argument("--supported-event-epoch", type=int, required=True)
+    delivery_compatibility = subparsers.add_parser(
+        "delivery-compatibility-check",
+        help="preflight delivery epoch and exact queued pointers before downgrade",
+    )
+    delivery_compatibility.add_argument(
+        "--supported-delivery-epoch", type=int, required=True
+    )
 
     daemon = subparsers.add_parser("daemon", help="run the long-lived monitor daemon")
     daemon.add_argument("--interval-seconds", type=float, default=2.0)
@@ -81,6 +134,20 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "list":
             _print(MonitorService(root).list())
             return 0
+        if arguments.command == "wait-for-event":
+            payload = load_private_json_payload(arguments.payload)
+            _print(asyncio.run(MonitorService(root).wait_for_event(**payload)))
+            return 0
+        if arguments.command == "defer-goal-until-event":
+            payload = load_private_json_payload(arguments.payload)
+            _print(asyncio.run(MonitorService(root).defer(**payload)))
+            return 0
+        if arguments.command == "status":
+            _print(MonitorService(root).status(arguments.monitor_id))
+            return 0
+        if arguments.command == "cancel":
+            _print(MonitorService(root).cancel(arguments.monitor_id))
+            return 0
         if arguments.command == "reconcile":
             # A normal operator should let the lock-owning daemon reconcile.
             # This manual command remains a diagnostic surface, so it spells
@@ -98,6 +165,68 @@ def main(argv: list[str] | None = None) -> int:
                     token=arguments.token,
                     status=arguments.status,
                 )
+            )
+            return 0
+        if arguments.command == "event-reserve":
+            payload = load_private_json_payload(arguments.payload)
+            descriptor = payload.pop("publisher_descriptor_path", None)
+            _print(
+                MonitorService(root).reserve_terminal_event(
+                    payload, descriptor_path=descriptor
+                )
+            )
+            return 0
+        if arguments.command == "event-status":
+            _print(MonitorService(root).event_status(arguments.reservation_id))
+            return 0
+        if arguments.command == "event-cancel":
+            _print(
+                MonitorService(root).cancel_terminal_event(arguments.reservation_id)
+            )
+            return 0
+        if arguments.command == "event-heartbeat":
+            payload = load_private_json_payload(arguments.payload)
+            _print(
+                MonitorService(root).publish_event_heartbeat(
+                    str(payload["reservation_id"]),
+                    publish_token=str(payload["publish_token"]),
+                    heartbeat=payload["heartbeat"],
+                )
+            )
+            return 0
+        if arguments.command == "event-publish":
+            payload = load_private_json_payload(arguments.payload)
+            _print(
+                MonitorService(root).publish_terminal_event(
+                    str(payload["reservation_id"]),
+                    publish_token=str(payload["publish_token"]),
+                    terminal_event=payload["terminal_event"],
+                )
+            )
+            return 0
+        if arguments.command == "event-compatibility-check":
+            assert_event_schema_compatible(
+                root, supported_event_epoch=arguments.supported_event_epoch
+            )
+            _print(
+                {
+                    "compatible": True,
+                    "supported_event_epoch": arguments.supported_event_epoch,
+                }
+            )
+            return 0
+        if arguments.command == "delivery-compatibility-check":
+            asyncio.run(
+                assert_delivery_runtime_compatible(
+                    root,
+                    supported_delivery_epoch=arguments.supported_delivery_epoch,
+                )
+            )
+            _print(
+                {
+                    "compatible": True,
+                    "supported_delivery_epoch": arguments.supported_delivery_epoch,
+                }
             )
             return 0
         if arguments.command == "daemon":

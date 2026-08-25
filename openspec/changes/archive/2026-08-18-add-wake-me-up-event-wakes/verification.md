@@ -351,4 +351,3 @@ rollback is:
 
 Terminal monitor rows are forensic evidence and are never replayed, so no
 ledger rollback is required.
-

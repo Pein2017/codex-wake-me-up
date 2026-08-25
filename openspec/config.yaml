@@ -55,7 +55,8 @@ rules:
   proposal:
     - State the operator-visible problem, the intended contract change, scope,
       non-goals, and which standing invariant the change touches.
-    - Name user-owned decisions explicitly: material cost, irreversible local
+    - >-
+      Name user-owned decisions explicitly: material cost, irreversible local
       behavior, and any weakening of the one-activation or fail-closed rules.
   specs:
     - Encode only verifiable behavior as capability-named specs with concrete
@@ -63,13 +64,15 @@ rules:
     - A MODIFIED requirement must carry the complete replacement scenario set,
       including every scenario it intends to keep. Archive-time spec sync
       rejects a block that would silently drop one.
-    - Distinguish evidence classes in scenario text: receipt success is
+    - >-
+      Distinguish evidence classes in scenario text: receipt success is
       authoritative, everything else is heuristic.
   design:
     - Enumerate every site that writes a terminal state and classify each as
       wake-eligible, retryable, or justified fail-closed. Error paths, not the
       happy path, are where stranding re-enters.
-    - Name the observable receipt for each behavior: which durable field, which
+    - >-
+      Name the observable receipt for each behavior: which durable field, which
       terminal outcome, which test.
   tasks:
     - Pair every error-path disposition with its own regression test.

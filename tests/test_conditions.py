@@ -132,18 +132,35 @@ def test_pid_absent_at_registration_is_rejected(tmp_path: Path) -> None:
         )
 
 
-def test_pid_exit_is_true_only_after_the_captured_process_disappears(tmp_path: Path) -> None:
+def _write_pid_stat(
+    proc: Path,
+    *,
+    pid: int = 73,
+    state: str = "S",
+    start_time: int = 1234,
+    command: str = "worker",
+) -> Path:
+    process = proc / str(pid)
+    process.mkdir(exist_ok=True)
+    # proc fields after the command begin at field 3; index 19 is starttime.
+    (process / "stat").write_text(
+        f"{pid} ({command}) {state} "
+        + " ".join(["0"] * 18 + [str(start_time), "0"]),
+        encoding="utf-8",
+    )
+    return process
+
+
+def _pid_observer(tmp_path: Path) -> tuple[Path, ObserverContext]:
     proc = tmp_path / "proc"
     (proc / "sys/kernel/random").mkdir(parents=True)
     (proc / "sys/kernel/random/boot_id").write_text("boot", encoding="utf-8")
-    process = proc / "73"
-    process.mkdir()
-    # proc fields after the command begin at field 3; index 19 is starttime.
-    (process / "stat").write_text(
-        "73 (worker) S " + " ".join(["0"] * 18 + ["1234", "0"]),
-        encoding="utf-8",
-    )
-    observer = ObserverContext(runtime_root=tmp_path, proc_root=proc)
+    return proc, ObserverContext(runtime_root=tmp_path, proc_root=proc)
+
+
+def test_pid_exit_is_true_after_the_captured_process_disappears(tmp_path: Path) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    process = _write_pid_stat(proc)
     prepared = prepare_condition(
         {"type": "pid_exit", "pid": 73},
         observer,
@@ -155,6 +172,106 @@ def test_pid_exit_is_true_only_after_the_captured_process_disappears(tmp_path: P
     (process / "stat").unlink()
     process.rmdir()
     assert evaluate_condition(prepared, observer).value == TriState.TRUE
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "x"])
+def test_pid_exit_treats_same_identity_terminal_state_as_terminated(
+    tmp_path: Path, state: str
+) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    _write_pid_stat(proc, state="S", command="worker with ) parens")
+    prepared = prepare_condition(
+        {"type": "pid_exit", "pid": 73},
+        observer,
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+
+    _write_pid_stat(proc, state=state, command="worker with ) parens")
+    result = evaluate_condition(prepared, observer)
+
+    assert result.value == TriState.TRUE
+    assert result.evidence == {
+        "classification": "liveness",
+        "pid": 73,
+        "state": state,
+        "kind": "process_terminated",
+    }
+
+
+@pytest.mark.parametrize("state", ["R", "S", "D", "T", "t", "I", "?"])
+def test_pid_exit_treats_nonterminal_state_as_alive(tmp_path: Path, state: str) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    _write_pid_stat(proc, state="S")
+    prepared = prepare_condition(
+        {"type": "pid_exit", "pid": 73},
+        observer,
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+
+    _write_pid_stat(proc, state=state)
+    result = evaluate_condition(prepared, observer)
+
+    assert result.value == TriState.FALSE
+    assert result.evidence["kind"] == "process_alive"
+    assert result.evidence["state"] == state
+
+
+def test_pid_exit_checks_identity_before_terminal_state(tmp_path: Path) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    _write_pid_stat(proc, state="S", start_time=1234)
+    prepared = prepare_condition(
+        {"type": "pid_exit", "pid": 73},
+        observer,
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+
+    _write_pid_stat(proc, state="Z", start_time=9999)
+    result = evaluate_condition(prepared, observer)
+
+    assert result.value == TriState.UNKNOWN
+    assert result.fatal
+    assert result.evidence["kind"] == "pid_identity_changed"
+
+
+def test_pid_exit_keeps_volatile_state_out_of_persisted_identity(tmp_path: Path) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    process = _write_pid_stat(proc, state="S")
+
+    prepared = prepare_condition(
+        {"type": "pid_exit", "pid": 73},
+        observer,
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+
+    assert prepared == {
+        "type": "pid_exit",
+        "identity": {
+            "pid": 73,
+            "boot_id": "boot",
+            "start_time": 1234,
+            "uid": process.stat().st_uid,
+        },
+    }
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "x"])
+def test_pid_exit_rejects_process_already_terminated_at_registration(
+    tmp_path: Path, state: str
+) -> None:
+    proc, observer = _pid_observer(tmp_path)
+    _write_pid_stat(proc, state=state)
+
+    with pytest.raises(ValidationError, match="already terminated"):
+        prepare_condition(
+            {"type": "pid_exit", "pid": 73},
+            observer,
+            monitor_id="monitor",
+            receipt_token="token",
+        )
 
 
 def test_tmux_exit_requires_the_captured_server_and_absent_target(tmp_path: Path) -> None:

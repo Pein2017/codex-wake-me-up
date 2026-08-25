@@ -121,7 +121,10 @@ def _read_boot_id(proc_root: Path) -> str:
         raise ValidationError("cannot read the host boot identity") from exc
 
 
-def _read_pid_identity(proc_root: Path, pid: int) -> dict[str, Any]:
+_TERMINAL_PROCESS_STATES = frozenset({"Z", "X", "x"})
+
+
+def _read_pid_snapshot(proc_root: Path, pid: int) -> tuple[dict[str, Any], str]:
     process_dir = proc_root / str(pid)
     try:
         process_stat = (process_dir / "stat").read_text(encoding="utf-8")
@@ -132,12 +135,27 @@ def _read_pid_identity(proc_root: Path, pid: int) -> dict[str, Any]:
         raise ValidationError(f"cannot inspect PID {pid}") from exc
     try:
         # The command name may contain spaces and parentheses. Fields after the
-        # final ')' begin at proc stat field 3; starttime is therefore index 19.
+        # final ')' begin at proc stat field 3. State is index 0 and starttime is
+        # index 19 in this suffix.
         fields_after_command = process_stat.rsplit(")", 1)[1].strip().split()
+        state = fields_after_command[0]
         start_time = int(fields_after_command[19])
     except (IndexError, ValueError) as exc:
         raise ValidationError(f"cannot parse process identity for PID {pid}") from exc
-    return {"pid": pid, "boot_id": _read_boot_id(proc_root), "start_time": start_time, "uid": uid}
+    if len(state) != 1:
+        raise ValidationError(f"cannot parse process identity for PID {pid}")
+    identity = {
+        "pid": pid,
+        "boot_id": _read_boot_id(proc_root),
+        "start_time": start_time,
+        "uid": uid,
+    }
+    return identity, state
+
+
+def _read_pid_identity(proc_root: Path, pid: int) -> dict[str, Any]:
+    identity, _state = _read_pid_snapshot(proc_root, pid)
+    return identity
 
 
 def _tmux_command(socket: str, *arguments: str) -> list[str]:
@@ -341,6 +359,31 @@ def prepare_condition(
                 raw, context, monitor_id=monitor_id, receipt_token=receipt_token
             ),
         }
+    if condition_type in {"command_terminal", "worker_terminal"}:
+        _only_keys(raw, {"type", "reservation_id"}, str(condition_type))
+        return {
+            "type": condition_type,
+            "reservation_id": _event_reservation_id(raw.get("reservation_id")),
+        }
+    if condition_type == "heartbeat_stale":
+        _only_keys(
+            raw,
+            {"type", "reservation_id", "stale_after_seconds"},
+            "heartbeat_stale",
+        )
+        stale_after = _expect_number(
+            raw.get("stale_after_seconds"),
+            "heartbeat_stale.stale_after_seconds",
+        )
+        if stale_after <= 0:
+            raise ValidationError(
+                "heartbeat_stale.stale_after_seconds must be positive"
+            )
+        return {
+            "type": "heartbeat_stale",
+            "reservation_id": _event_reservation_id(raw.get("reservation_id")),
+            "stale_after_seconds": stale_after,
+        }
     if condition_type == "time":
         _only_keys(raw, {"type", "after_seconds", "at_utc"}, "time")
         has_relative = "after_seconds" in raw
@@ -385,7 +428,10 @@ def prepare_condition(
         pid = raw.get("pid")
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise ValidationError("pid_exit.pid must be a positive integer")
-        return {"type": "pid_exit", "identity": _read_pid_identity(context.proc_root, pid)}
+        identity, state = _read_pid_snapshot(context.proc_root, pid)
+        if state in _TERMINAL_PROCESS_STATES:
+            raise ValidationError(f"PID {pid} has already terminated")
+        return {"type": "pid_exit", "identity": identity}
     if condition_type == "tmux_exit":
         _only_keys(raw, {"type", "target_kind", "target", "socket"}, "tmux_exit")
         return _capture_tmux_identity(raw, context)
@@ -405,8 +451,125 @@ def prepare_condition(
         return _capture_thread_idle(raw, context)
     raise ValidationError(
         "unsupported condition type; use time, gpu_stable, pid_exit, tmux_exit, "
-        "log_pattern, thread_idle, receipt_success, all, or any"
+        "log_pattern, thread_idle, receipt_success, command_terminal, "
+        "worker_terminal, heartbeat_stale, all, or any"
     )
+
+
+def _event_reservation_id(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 256
+        or "\0" in value
+    ):
+        raise ValidationError("event reservation_id must be a bounded string")
+    return value
+
+
+def event_condition_binding(
+    condition: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Validate one-monitor/one-reservation event-leaf cardinality."""
+
+    reservations: set[str] = set()
+    terminal_leaves: list[tuple[str, str]] = []
+
+    def visit(node: Mapping[str, Any]) -> None:
+        condition_type = node.get("type")
+        if condition_type in {"all", "any"}:
+            children = node.get("children")
+            if not isinstance(children, list):
+                raise ValidationError("event condition children must be a list")
+            for child in children:
+                if not isinstance(child, Mapping):
+                    raise ValidationError("event condition child must be an object")
+                visit(child)
+            return
+        if condition_type in {
+            "command_terminal",
+            "worker_terminal",
+            "heartbeat_stale",
+        }:
+            reservation_id = _event_reservation_id(node.get("reservation_id"))
+            reservations.add(reservation_id)
+            if condition_type in {"command_terminal", "worker_terminal"}:
+                terminal_leaves.append((reservation_id, str(condition_type)))
+
+    visit(condition)
+    if not reservations:
+        return None
+    if len(reservations) != 1:
+        raise ValidationError("one monitor may name only one distinct reservation")
+    if len(terminal_leaves) != 1:
+        if len(terminal_leaves) > 1:
+            raise ValidationError("event monitor contains a duplicate terminal leaf")
+        raise ValidationError("event monitor requires exactly one terminal leaf")
+    reservation_id, event_kind = terminal_leaves[0]
+    if reservation_id not in reservations:
+        raise ValidationError("terminal leaf reservation is inconsistent")
+    return reservation_id, event_kind
+
+
+def contains_event_condition(condition: Mapping[str, Any]) -> bool:
+    """Detect event leaves without trusting the stored AST's cardinality."""
+
+    condition_type = condition.get("type")
+    if condition_type in {
+        "command_terminal",
+        "worker_terminal",
+        "heartbeat_stale",
+    }:
+        return True
+    children = condition.get("children")
+    if not isinstance(children, list):
+        return False
+    return any(
+        contains_event_condition(child)
+        for child in children
+        if isinstance(child, Mapping)
+    )
+
+
+def observe_external_condition_leaves(
+    condition: Mapping[str, Any], context: ObserverContext
+) -> tuple[dict[str, Any], dict[tuple[int, ...], Evaluation]]:
+    """Observe non-event leaves before entering the event claim transaction."""
+
+    observed = copy.deepcopy(dict(condition))
+    evaluations: dict[tuple[int, ...], Evaluation] = {}
+
+    def visit(node: MutableMapping[str, Any], path: tuple[int, ...]) -> None:
+        condition_type = node.get("type")
+        if condition_type in {"all", "any"}:
+            children = node.get("children")
+            if not isinstance(children, list):
+                evaluations[path] = _event_unknown(
+                    str(condition_type), "invalid_stored_children"
+                )
+                return
+            for index, child in enumerate(children):
+                if isinstance(child, MutableMapping):
+                    visit(child, (*path, index))
+                else:
+                    evaluations[(*path, index)] = _event_unknown(
+                        str(condition_type), "invalid_stored_child"
+                    )
+            return
+        if condition_type not in {
+            "command_terminal",
+            "worker_terminal",
+            "heartbeat_stale",
+        }:
+            try:
+                evaluations[path] = evaluate_condition(node, context)
+            except (KeyError, TypeError, ValueError, ValidationError):
+                evaluations[path] = _event_unknown(
+                    str(condition_type), "invalid_stored_external_leaf"
+                )
+
+    visit(observed, ())
+    return observed, evaluations
 
 
 def public_condition_semantics(raw: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -494,7 +657,7 @@ def _evaluate_pid(condition: Mapping[str, Any], context: ObserverContext) -> Eva
     if not process_dir.exists():
         return _leaf(TriState.TRUE, "pid_exit", {"pid": pid, "kind": "process_absent"})
     try:
-        current = _read_pid_identity(context.proc_root, pid)
+        current, state = _read_pid_snapshot(context.proc_root, pid)
     except ValidationError as exc:
         return _leaf(TriState.UNKNOWN, "pid_exit", {"error": str(exc)})
     if current != dict(identity):
@@ -504,7 +667,17 @@ def _evaluate_pid(condition: Mapping[str, Any], context: ObserverContext) -> Eva
             {"kind": "pid_identity_changed", "current": current},
             fatal=True,
         )
-    return _leaf(TriState.FALSE, "pid_exit", {"pid": pid, "kind": "process_alive"})
+    if state in _TERMINAL_PROCESS_STATES:
+        return _leaf(
+            TriState.TRUE,
+            "pid_exit",
+            {"pid": pid, "state": state, "kind": "process_terminated"},
+        )
+    return _leaf(
+        TriState.FALSE,
+        "pid_exit",
+        {"pid": pid, "state": state, "kind": "process_alive"},
+    )
 
 
 def _tmux_server_pid(condition: Mapping[str, Any], context: ObserverContext) -> tuple[int | None, str | None]:
@@ -910,6 +1083,159 @@ def _combine(condition_type: str, children: list[Evaluation]) -> Evaluation:
     )
 
 
+def evaluate_event_condition_tree(
+    condition: Mapping[str, Any],
+    event_status: Mapping[str, Any] | None,
+    *,
+    now: float,
+    external_evaluations: Mapping[tuple[int, ...], Evaluation] | None = None,
+    _path: tuple[int, ...] = (),
+) -> Evaluation:
+    """Evaluate event leaves from one transaction-current reservation snapshot."""
+
+    condition_type = condition.get("type")
+    if condition_type in {"all", "any"}:
+        children = condition.get("children")
+        if not isinstance(children, list) or any(
+            not isinstance(child, Mapping) for child in children
+        ):
+            return _event_unknown(str(condition_type), "invalid_stored_children")
+        return _combine(
+            str(condition_type),
+            [
+                evaluate_event_condition_tree(
+                    child,
+                    event_status,
+                    now=now,
+                    external_evaluations=external_evaluations,
+                    _path=(*_path, index),
+                )
+                for index, child in enumerate(children)
+            ],
+        )
+    if condition_type not in {
+        "command_terminal",
+        "worker_terminal",
+        "heartbeat_stale",
+    }:
+        if external_evaluations is not None and _path in external_evaluations:
+            return external_evaluations[_path]
+        return _event_unknown(str(condition_type), "external_leaf_not_observed")
+    if event_status is None:
+        return _event_unknown(str(condition_type), "missing_bound_reservation")
+    reservation_id = condition.get("reservation_id")
+    if (
+        event_status.get("reservation_id") != reservation_id
+        or event_status.get("bound_monitor_id") in {None, ""}
+    ):
+        return _event_unknown(str(condition_type), "reservation_identity_mismatch")
+    expected_kind = (
+        str(condition_type)
+        if condition_type in {"command_terminal", "worker_terminal"}
+        else event_status.get("kind")
+    )
+    if event_status.get("kind") != expected_kind:
+        return _event_unknown(str(condition_type), "reservation_kind_mismatch")
+    if event_status.get("cancelled_at") is not None or event_status.get("expired_at") is not None:
+        return _event_unknown(str(condition_type), "bound_reservation_terminality_corrupt")
+
+    terminal = event_status.get("terminal_event")
+    heartbeat = event_status.get("last_heartbeat")
+    if condition_type == "heartbeat_stale":
+        if terminal is not None:
+            return Evaluation(
+                value=TriState.FALSE,
+                evidence={
+                    "type": "heartbeat_stale",
+                    "reservation_id": reservation_id,
+                    "kind": "terminal_event_present",
+                },
+            )
+        if not isinstance(heartbeat, Mapping):
+            return Evaluation(
+                value=TriState.UNKNOWN,
+                evidence={
+                    "type": "heartbeat_stale",
+                    "reservation_id": reservation_id,
+                    "kind": "heartbeat_unavailable",
+                },
+            )
+        try:
+            received_at = float(heartbeat["host_received_at"])
+            sequence = int(heartbeat["sequence"])
+            stale_after = float(condition["stale_after_seconds"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return _event_unknown("heartbeat_stale", "corrupt_heartbeat")
+        age = max(0.0, float(now) - received_at)
+        evidence = {
+            "type": "heartbeat_stale",
+            "reservation_id": reservation_id,
+            "producer_id": event_status.get("producer_id"),
+            "last_sequence": sequence,
+            "host_received_at": received_at,
+            "age_seconds": age,
+            "stale_after_seconds": stale_after,
+            "classification": "heuristic_stall",
+            "task_success": False,
+            "lead_accepted": False,
+        }
+        value = TriState.TRUE if age >= stale_after else TriState.FALSE
+        return Evaluation(
+            value=value,
+            evidence=evidence,
+            witness=(dict(evidence),) if value is TriState.TRUE else (),
+        )
+
+    if terminal is None:
+        if event_status.get("state") == "terminal":
+            return _event_unknown(str(condition_type), "terminal_payload_missing")
+        return Evaluation(
+            value=TriState.FALSE,
+            evidence={
+                "type": condition_type,
+                "reservation_id": reservation_id,
+                "kind": "awaiting_terminal_event",
+            },
+        )
+    if not isinstance(terminal, Mapping) or terminal.get("kind") != condition_type:
+        return _event_unknown(str(condition_type), "terminal_payload_kind_mismatch")
+
+    classification = "command_termination"
+    if condition_type == "worker_terminal":
+        if terminal.get("outcome") != "delivered":
+            classification = "worker_terminal_failure"
+        elif isinstance(event_status.get("git_attestation"), Mapping) and event_status[
+            "git_attestation"
+        ].get("status") == "valid":
+            classification = "valid_delivery_candidate"
+        else:
+            classification = "invalid_delivery"
+    witness = {
+        "type": condition_type,
+        "reservation_id": reservation_id,
+        "producer_id": event_status.get("producer_id"),
+        "classification": classification,
+        "task_success": False,
+        "lead_accepted": False,
+        "terminal_event": copy.deepcopy(dict(terminal)),
+        "last_heartbeat": copy.deepcopy(heartbeat),
+        "git_attestation": copy.deepcopy(event_status.get("git_attestation")),
+    }
+    return Evaluation(
+        value=TriState.TRUE,
+        evidence=dict(witness),
+        witness=(witness,),
+    )
+
+
+def _event_unknown(condition_type: str, kind: str) -> Evaluation:
+    return Evaluation(
+        value=TriState.UNKNOWN,
+        evidence={"type": condition_type, "kind": kind},
+        fatal=True,
+    )
+
+
 def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverContext) -> Evaluation:
     """Evaluate and update the condition's small durable observation state.
 
@@ -941,12 +1267,17 @@ def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverCon
         # Children must be mutable: latch state persists only through in-place
         # mutation, so an immutable child is corrupted stored state, never a
         # silently unlatched evaluation.
-        mutable_children = (
-            [child for child in raw_children if isinstance(child, MutableMapping)]
-            if isinstance(raw_children, list)
-            else None
-        )
-        if mutable_children is None or len(mutable_children) != len(raw_children):
+        if not isinstance(raw_children, list):
+            return _leaf(
+                TriState.UNKNOWN,
+                str(condition_type),
+                {"kind": "invalid_stored_children"},
+                fatal=True,
+            )
+        mutable_children = [
+            child for child in raw_children if isinstance(child, MutableMapping)
+        ]
+        if len(mutable_children) != len(raw_children):
             return _leaf(
                 TriState.UNKNOWN,
                 str(condition_type),
@@ -971,7 +1302,9 @@ def witness_authorizes_continuation(
     """Receipt truth or an explicit opt-in is required for a goal mutation."""
 
     return allow_heuristic_continuation or any(
-        item.get("type") == "receipt_success" for item in witness
+        item.get("type")
+        in {"receipt_success", "command_terminal", "worker_terminal"}
+        for item in witness
     )
 
 

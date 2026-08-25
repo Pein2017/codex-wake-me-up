@@ -107,6 +107,78 @@ def test_active_defer_orders_intent_readiness_pause_and_confirmation(tmp_path) -
     assert result["next_action"] == "end_current_turn"
 
 
+def test_paused_defer_uses_stable_capture_without_another_pause(tmp_path) -> None:
+    clock = Clock()
+    marker = goal()
+    fake = FakeAppServer(
+        [
+            observation(runtime_status="idle", goal_status="paused", marker=marker),
+            observation(runtime_status="idle", goal_status="paused", marker=marker),
+        ]
+    )
+    service = _service(tmp_path, fake, clock)
+
+    result = asyncio.run(
+        service.defer(
+            thread_id="test-thread",
+            condition={"type": "time", "after_seconds": 10},
+            expires_in_seconds=100,
+            idempotency_key="defer-paused",
+        )
+    )
+
+    assert fake.pause_calls == []
+    assert not fake.observations
+    assert result["state"] == MonitorState.ARMED
+    assert result["mode"] == "deferred"
+    assert result["idle_barrier"]
+    assert result["outcome"]["kind"] == "paused_guard_confirmed"
+    assert result["next_action"] == "end_current_turn"
+
+
+def test_defer_without_goal_rejects_without_creating_or_pausing(tmp_path) -> None:
+    clock = Clock()
+    fake = FakeAppServer([observation(runtime_status="active", goal_status=None)])
+    service = _service(tmp_path, fake, clock)
+
+    with pytest.raises(
+        ValidationError,
+        match="Do not create a goal to satisfy this precondition",
+    ):
+        asyncio.run(
+            service.defer(
+                thread_id="test-thread",
+                condition={"type": "time", "after_seconds": 10},
+                expires_in_seconds=100,
+                idempotency_key="defer-without-goal",
+            )
+        )
+
+    assert fake.pause_calls == []
+    assert service.ledger.list() == []
+
+
+def test_register_without_goal_rejects_without_creating_monitor(tmp_path) -> None:
+    clock = Clock()
+    fake = FakeAppServer([observation(runtime_status="active", goal_status=None)])
+    service = _service(tmp_path, fake, clock)
+
+    with pytest.raises(
+        ValidationError,
+        match="Do not create a goal to satisfy this precondition",
+    ):
+        asyncio.run(
+            service.register(
+                thread_id="test-thread",
+                condition={"type": "time", "after_seconds": 10},
+                expires_in_seconds=100,
+                start_daemon=False,
+            )
+        )
+
+    assert service.ledger.list() == []
+
+
 def test_defer_readiness_failure_is_terminal_and_does_not_pause(tmp_path) -> None:
     clock = Clock()
     fake = FakeAppServer(

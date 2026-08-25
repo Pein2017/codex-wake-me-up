@@ -1,14 +1,14 @@
 {
   "name": "codex-wake-me-up",
-  "version": "0.1.0+codex.20260818092924",
-  "description": "Host-local durable monitors for guarded Codex goal continuation.",
+  "version": "0.1.0+codex.20260823095611",
+  "description": "Host-local durable event monitors that wake the current root Codex task.",
   "author": {
     "name": "CoordExp"
   },
   "interface": {
     "displayName": "Codex Wake Me Up",
-    "shortDescription": "Guarded local defer and wake-up monitors for Codex goals.",
-    "longDescription": "Arms a typed host-local monitor and conservatively defers or continues one guarded Codex goal when its condition is met.",
+    "shortDescription": "Durable local event monitors that wake the root Codex task.",
+    "longDescription": "Arms a typed host-local monitor, ends the waiting turn, and later wakes only the root Codex task through its durable queue; goals remain optional.",
     "developerName": "CoordExp",
     "category": "Productivity",
     "capabilities": [
@@ -16,7 +16,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "For a long same-host job, conservatively defer my active goal and arm one guarded wake-up monitor."
+      "For a long same-host job, arm a goal-independent monitor and wake my root task when the event fires."
     ],
     "composerIcon": "./assets/wake-me-up-icon.png",
     "logo": "./assets/wake-me-up-icon.png"
