@@ -99,18 +99,28 @@ Registration authorizes the later billed task turn and, for a stored unloaded
 target, an unconditional exact-thread resume that can release user-authored FIFO
 items ahead of the monitor pointer. Their identities and count are persisted
 before resume. The pointer itself is small, names the origin task UUID, and tells
-the root to inspect status once; it is not a success claim.
+the root to call `wake_me_up_status(monitor_id, view="decision")` exactly once;
+it carries no result and is not a success claim.
 
 `defer_goal_until_event` takes the same monitor fields plus the legacy heuristic
 authorization for an explicit active or paused goal. `wake_me_up` and
 `wake_me_up_defer` remain compatibility aliases for paused and active goal
 delivery respectively; neither alias creates a goal or selects thread delivery.
 
-`wake_me_up_status` returns the captured guard, evidence, outcome, timestamps,
-and `supervision` (`healthy` or `unsupervised`). `wake_me_up_cancel` cancels a
-registering, armed, or claimed monitor; it cannot undo an activation already
-recorded as `activating`, nor compensate for a possibly delivered pause.
-`wake_me_up_publish_receipt` writes a monitor's receipt atomically.
+`wake_me_up_status` defaults to the compact, self-describing `decision` view.
+Pass `view="audit"` for the unchanged full forensic status used by CLI and
+operators. One call selects one view; the normal wake path does not require a
+second details request. `wake_me_up_cancel` cancels a registering, armed, or
+claimed monitor; it cannot undo an activation already recorded as `activating`,
+nor compensate for a possibly delivered pause. `wake_me_up_publish_receipt`
+writes a monitor's receipt atomically.
+
+Registration also has a dedicated compact projection: an armed receipt contains
+only monitor/idempotency identity, state, compact condition binding, expiry,
+origin and root delivery target, delivery kind, supervision, targeting, next
+action, and any required receipt instructions. Full capability, empty evidence,
+witness, outcome, and reconciliation fields remain in durable audit status, not
+the ordinary model response.
 
 The MCP request timeout is only a control-call bound. Once registration returns
 an `armed` durable receipt, the detached daemon owns observation and delivery
@@ -409,16 +419,25 @@ stays retryable, and falls back on expiry.
 
 ### The wake report
 
-Every fired monitor's terminal receipt is self-describing, so one
-`wake_me_up_status` call fully re-orients the woken agent: the wake reason, the
-satisfying witness (or failure detail), the bounded matched-line
-`journal_tail`, `armed_at`/`fired_at`, waited seconds, evaluation count, and an
-estimate of how many polling turns the wait avoided at the 180-second
-long-poll floor.
+Every fired monitor's decision view is self-describing, so one status call fully
+re-orients the woken agent: wake reason, satisfying witness or observer failure,
+arming/firing/wait statistics, selected delivery facts and final classification,
+abnormal delivery diagnostics, re-arm chain, and bounded terminal-event evidence.
+Normal `recorded` responses omit capability snapshots, queue receipts, full
+reconciliation, duplicate delivery outcomes, nulls, empty containers, and
+meaningless defaults. The `audit` view retains the complete durable surface.
 
-The stored condition keeps its own journal, but `status` and registration
-responses elide it to `{lines_stored, dropped}`: `outcome.journal_tail` is the
-sole line carrier, so post-wake context is spent once rather than twice.
+Decision journal lines are consecutive-run compressed to
+`{"line":"...","repeat_count":N}` and keep an explicit dropped count. The
+durable condition journal is unchanged. Terminal-event reports retain producer,
+candidate, attestation, failure evidence, and explicit
+`task_success=false` / `lead_accepted=false`; publish tokens, credentials, raw
+commands, and sensitive user text remain absent.
+
+These are model-facing payload reductions, not an end-to-end billing proof. A
+real wake still creates a new model turn, and a long thread may still incur
+cached-context reads that the plugin cannot remove. Daemon evaluation polling
+does not itself consume model input tokens.
 
 ### Re-arm lineage
 
@@ -441,7 +460,7 @@ heartbeat. If it is absent after a reboot or failure, `status` reports
 
 ```bash
 codex-wake-me-up doctor --thread-id <loaded-thread-id>
-codex-wake-me-up list
+codex-wake-me-up list              # compact decision summaries
 codex-wake-me-up daemon --once     # one recovery + one reconcile pass, then exit
 ```
 

@@ -151,10 +151,19 @@ async def wake_me_up_defer(
 
 @mcp.tool(
     name="wake_me_up_status",
-    description="Inspect a monitor's target guard, evidence, outcome, and daemon supervision state.",
+    description=(
+        "Read one monitor once after a wake. The default decision view is the "
+        "compact self-describing wake report; audit returns the full forensic status."
+    ),
 )
-def wake_me_up_status(monitor_id: str) -> dict[str, Any]:
-    return service().status(monitor_id)
+def wake_me_up_status(
+    monitor_id: str, view: str = "decision"
+) -> dict[str, Any]:
+    if view == "decision":
+        return service().decision_status(monitor_id)
+    if view == "audit":
+        return service().status(monitor_id)
+    raise ValidationError("view must be decision or audit")
 
 
 @mcp.tool(

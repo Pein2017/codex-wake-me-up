@@ -783,6 +783,40 @@ def journal_tail(condition: Mapping[str, Any], *, limit: int) -> list[str]:
     return collected[-limit:]
 
 
+def compact_journal_tail(
+    condition: Mapping[str, Any], *, limit: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Return the newest distinct journal runs and the total dropped line count."""
+
+    def collect(value: Mapping[str, Any]) -> tuple[list[str], int]:
+        if value.get("type") == "log_pattern":
+            journal = value.get("journal") or {}
+            return (
+                [str(item) for item in (journal.get("lines") or [])],
+                int(journal.get("dropped") or 0),
+            )
+        lines: list[str] = []
+        dropped = 0
+        for child in value.get("children") or []:
+            if isinstance(child, Mapping):
+                child_lines, child_dropped = collect(child)
+                lines.extend(child_lines)
+                dropped += child_dropped
+        return lines, dropped
+
+    lines, dropped = collect(condition)
+    runs: list[dict[str, Any]] = []
+    for line in lines:
+        if runs and runs[-1]["line"] == line:
+            runs[-1]["repeat_count"] += 1
+        else:
+            runs.append({"line": line, "repeat_count": 1})
+    if len(runs) > limit:
+        dropped += sum(item["repeat_count"] for item in runs[:-limit])
+        runs = runs[-limit:]
+    return runs, dropped
+
+
 def elide_condition_journals(condition: Any) -> Any:
     """Return a copy whose journal lines collapse to counters.
 

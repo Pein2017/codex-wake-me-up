@@ -419,6 +419,13 @@ def test_invalid_worker_delivery_still_wakes_for_independent_review(tmp_path) ->
     assert status["state"] == "fired"
     assert status["witness"][0]["classification"] == "invalid_delivery"
     assert status["witness"][0]["lead_accepted"] is False
+    decision = monitor_service.decision_status(registered["monitor_id"])
+    assert decision["terminal_event"]["git_attestation"]["status"] == (
+        "out_of_scope"
+    )
+    assert decision["terminal_event"]["terminal_event"]["candidate_oid"] == candidate
+    assert decision["task_success"] is False
+    assert decision["lead_accepted"] is False
     assert len(app_server.activation_calls) == 1
 
 

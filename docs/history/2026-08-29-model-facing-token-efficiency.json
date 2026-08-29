@@ -1,0 +1,31 @@
+{
+  "claim_boundary": "Model-facing canonical JSON payload reduction only; not an end-to-end billed-token measurement.",
+  "encoding": "json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8",
+  "payloads": {
+    "arm_any_log_pid": {
+      "before": {"bytes": 2119, "rough_tokens_chars_div_4": 529.75, "top_level_fields": 29},
+      "after": {"bytes": 800, "rough_tokens_chars_div_4": 200.0, "top_level_fields": 9}
+    },
+    "recorded_success": {
+      "before": {"bytes": 3058, "rough_tokens_chars_div_4": 764.5, "top_level_fields": 27},
+      "after": {"bytes": 534, "rough_tokens_chars_div_4": 133.5, "top_level_fields": 10}
+    },
+    "observer_failure": {
+      "before": {"bytes": 1972, "rough_tokens_chars_div_4": 493.0, "top_level_fields": 27},
+      "after": {"bytes": 555, "rough_tokens_chars_div_4": 138.75, "top_level_fields": 10}
+    },
+    "delivery_uncertain": {
+      "before": {"bytes": 2534, "rough_tokens_chars_div_4": 633.5, "top_level_fields": 27},
+      "after": {"bytes": 1038, "rough_tokens_chars_div_4": 259.5, "top_level_fields": 10}
+    }
+  },
+  "skill_entrypoint": {
+    "before": {"chars": 15533, "rough_tokens_chars_div_4": 3883.25, "lines": 293},
+    "after": {"chars": 5062, "rough_tokens_chars_div_4": 1265.5, "lines": 101}
+  },
+  "unavoidable_costs": [
+    "A delivered wake starts a new model turn.",
+    "A long thread can still incur cached-context reads.",
+    "Daemon evaluation_count is host polling and does not itself consume model input tokens."
+  ]
+}

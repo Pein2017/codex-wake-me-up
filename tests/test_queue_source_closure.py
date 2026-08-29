@@ -16,10 +16,8 @@ from codex_wake_me_up.daemon import (
 from codex_wake_me_up.delivery import DeliveryKind, ThreadDeliveryState, build_thread_delivery
 from codex_wake_me_up.ledger import Ledger
 from codex_wake_me_up.models import (
-    AppServerError,
     AppServerRejectedError,
     GoalMarker,
-    MonitorMode,
     MonitorState,
     TargetGuard,
     ValidationError,
@@ -572,8 +570,8 @@ def test_thread_registration_is_independent_of_every_goal_state(
         )
     )
 
-    assert result["delivery_kind"] == DeliveryKind.THREAD
-    assert result["target"] == {"thread_id": "thread-1"}
+    assert result["delivery"]["kind"] == DeliveryKind.THREAD
+    assert result["delivery"]["target_thread_id"] == "thread-1"
     assert adapter.add_calls == []
 
 

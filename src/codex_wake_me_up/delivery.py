@@ -60,7 +60,8 @@ def build_thread_delivery(
     pointer = (
         f"[codex-wake-me-up monitor={monitor_id} delivery={delivery_id} "
         f"origin={origin_thread_id}] "
-        "Inspect wake_me_up_status once. This pointer is not a success claim."
+        'Call wake_me_up_status(monitor_id, view="decision") exactly once. '
+        "This pointer is not a success claim."
     )
     if len(pointer) > DELIVERY_POINTER_MAX_CHARS:
         raise ValueError("thread-delivery pointer exceeds its bound")

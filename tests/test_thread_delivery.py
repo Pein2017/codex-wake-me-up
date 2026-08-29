@@ -188,7 +188,8 @@ def test_thread_pointer_is_stable_bounded_and_contains_no_wake_evidence() -> Non
         "[codex-wake-me-up monitor=monitor-1 "
         "delivery=77de7ce7-72be-5f1a-b4ca-5fc2c90e3a77 "
         "origin=thread-1] "
-        "Inspect wake_me_up_status once. This pointer is not a success claim."
+        'Call wake_me_up_status(monitor_id, view="decision") exactly once. '
+        "This pointer is not a success claim."
     )
     assert len(first["pointer"]) <= DELIVERY_POINTER_MAX_CHARS
     assert first["pointer_digest"] == hashlib.sha256(
@@ -696,8 +697,8 @@ def test_wait_for_event_arms_exact_thread_without_reading_or_mutating_a_goal(
     )
 
     assert result["state"] == MonitorState.ARMED
-    assert result["delivery_kind"] == DeliveryKind.THREAD
-    assert result["target"] == {"thread_id": "thread-1"}
+    assert result["delivery"]["kind"] == DeliveryKind.THREAD
+    assert result["delivery"]["target_thread_id"] == "thread-1"
     assert result["next_action"] == "end_current_turn"
     assert result["targeting"]["authenticated_current_task"] is False
     assert adapter.preflight_calls == ["thread-1"]
@@ -725,10 +726,13 @@ def test_subagent_registration_preserves_origin_and_targets_only_the_root(
         )
     )
 
-    assert result["target"] == {"thread_id": "root"}
     assert result["delivery"]["origin_thread_id"] == "child"
-    assert result["delivery"]["thread_id"] == "root"
-    assert result["delivery"]["relay_chain"] == ["child", "parent", "root"]
+    assert result["delivery"]["target_thread_id"] == "root"
+    assert service.status(result["monitor_id"])["delivery"]["relay_chain"] == [
+        "child",
+        "parent",
+        "root",
+    ]
     record = service.ledger.get(result["monitor_id"])
     assert record is not None
     assert record.semantic["thread_id"] == "child"
@@ -788,7 +792,7 @@ def test_subagent_registration_allows_its_own_thread_idle_for_a_root_wake(
     )
 
     assert result["state"] == MonitorState.ARMED
-    assert result["delivery"]["thread_id"] == "root"
+    assert result["delivery"]["target_thread_id"] == "root"
     assert observer_adapter.child_reads == ["child"]
 
 
@@ -843,7 +847,9 @@ def test_trusted_mcp_service_entry_records_authenticated_origin(tmp_path) -> Non
         "authenticated_current_task": True,
         "same_thread_fifo_release_authorized": True,
     }
-    assert result["delivery"]["origin_binding"] == "trusted_mcp_caller"
+    assert service.status(result["monitor_id"])["delivery"]["origin_binding"] == (
+        "trusted_mcp_caller"
+    )
 
 
 @pytest.mark.parametrize("expiry", [float("nan"), float("inf")])

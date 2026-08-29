@@ -50,8 +50,9 @@ def test_active_main_thread_can_register_its_own_paused_goal(tmp_path) -> None:
     )
 
     assert result["state"] == MonitorState.ARMED
-    assert result["mode"] == "legacy"
-    assert not result["idle_barrier"]
+    audit = service.status(result["monitor_id"])
+    assert audit["mode"] == "legacy"
+    assert not audit["idle_barrier"]
 
 
 def test_active_defer_orders_intent_readiness_pause_and_confirmation(tmp_path) -> None:
@@ -101,8 +102,9 @@ def test_active_defer_orders_intent_readiness_pause_and_confirmation(tmp_path) -
     ]
     assert fake.pause_calls == ["test-thread"]
     assert result["state"] == MonitorState.ARMED
-    assert result["mode"] == "deferred"
-    assert result["idle_barrier"]
+    audit = service.status(result["monitor_id"])
+    assert audit["mode"] == "deferred"
+    assert audit["idle_barrier"]
     assert result["targeting"]["authenticated_current_task"] is False
     assert result["next_action"] == "end_current_turn"
 
@@ -130,9 +132,10 @@ def test_paused_defer_uses_stable_capture_without_another_pause(tmp_path) -> Non
     assert fake.pause_calls == []
     assert not fake.observations
     assert result["state"] == MonitorState.ARMED
-    assert result["mode"] == "deferred"
-    assert result["idle_barrier"]
-    assert result["outcome"]["kind"] == "paused_guard_confirmed"
+    audit = service.status(result["monitor_id"])
+    assert audit["mode"] == "deferred"
+    assert audit["idle_barrier"]
+    assert audit["outcome"]["kind"] == "paused_guard_confirmed"
     assert result["next_action"] == "end_current_turn"
 
 
@@ -1318,8 +1321,9 @@ def test_wake_report_carries_the_journal_tail_while_status_elides_the_journal(tm
         },
         allow_heuristic_continuation=True,
     )
-    # Registration responses already carry counters, never stored lines.
-    assert registered["condition"]["journal"] == {"lines_stored": 0, "dropped": 0}
+    # Registration responses carry only the observer binding summary.
+    assert registered["condition"]["pattern_names"] == ["ready", "crash"]
+    assert "journal" not in registered["condition"]
 
     with log.open("a", encoding="utf-8") as handle:
         handle.write("step 1\nReady in 9.5s\n")
@@ -1386,8 +1390,13 @@ def test_rearm_lineage_validates_stores_and_surfaces_the_chain(tmp_path) -> None
     third = asyncio.run(service.register(**request, rearm_of=second["monitor_id"]))
 
     assert second["rearm_of"] == first["monitor_id"]
-    assert second["rearm_chain"] == [first["monitor_id"]]
-    assert third["rearm_chain"] == [second["monitor_id"], first["monitor_id"]]
+    assert service.decision_status(second["monitor_id"])["rearm_chain"] == [
+        first["monitor_id"]
+    ]
+    assert service.decision_status(third["monitor_id"])["rearm_chain"] == [
+        second["monitor_id"],
+        first["monitor_id"],
+    ]
     assert third["state"] == MonitorState.ARMED
     listed = {item["monitor_id"]: item for item in service.list()}
     assert listed[third["monitor_id"]]["rearm_chain"] == [

@@ -15,6 +15,7 @@ from .app_server import AppServerClient
 from .delivery import DeliveryKind, ThreadDeliveryState, build_thread_delivery
 from .conditions import (
     ObserverContext,
+    compact_journal_tail,
     contains_event_condition,
     elide_condition_journals,
     event_condition_binding,
@@ -70,8 +71,73 @@ ObserverContextFactory = Callable[[], ObserverContext]
 # The repo's long-poll yield floor: what one avoided polling turn would cost.
 POLL_YIELD_FLOOR_SECONDS = 180.0
 WAKE_JOURNAL_TAIL_LINES = 20
+DECISION_JOURNAL_TAIL_RUNS = 8
 MAX_REARM_CHAIN = 20
 _TRUSTED_MCP_CALLER_BINDING = object()
+
+
+def _condition_binding_summary(condition: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one prepared condition to the binding facts needed at arm time."""
+
+    condition_type = str(condition.get("type", ""))
+    summary: dict[str, Any] = {"type": condition_type}
+    if condition_type in {"all", "any"}:
+        summary["children"] = [
+            _condition_binding_summary(child)
+            for child in condition.get("children") or []
+            if isinstance(child, Mapping)
+        ]
+    elif condition_type == "time":
+        summary["deadline_utc"] = condition.get("deadline_utc")
+    elif condition_type == "gpu_stable":
+        for key in (
+            "devices",
+            "max_utilization_percent",
+            "stable_for_seconds",
+        ):
+            summary[key] = condition.get(key)
+    elif condition_type == "pid_exit":
+        summary["identity"] = dict(condition.get("identity") or {})
+    elif condition_type == "tmux_exit":
+        for key in (
+            "target_kind",
+            "socket",
+            "server_pid",
+            "target_id",
+            "session_id",
+        ):
+            summary[key] = condition.get(key)
+    elif condition_type == "log_pattern":
+        summary.update(
+            {
+                "path": condition.get("path"),
+                "pattern_names": [
+                    item.get("name")
+                    for item in condition.get("patterns") or []
+                    if isinstance(item, Mapping)
+                ],
+                "identity": condition.get("identity"),
+                "offset": condition.get("offset"),
+                "missing_at_arm": bool(condition.get("missing_at_arm")),
+            }
+        )
+    elif condition_type == "thread_idle":
+        for key in (
+            "thread_id",
+            "accept_already_idle",
+            "armed_runtime_status",
+        ):
+            summary[key] = condition.get(key)
+    elif condition_type in {"command_terminal", "worker_terminal"}:
+        summary["reservation_id"] = condition.get("reservation_id")
+    elif condition_type == "heartbeat_stale":
+        summary.update(
+            {
+                "reservation_id": condition.get("reservation_id"),
+                "stale_after_seconds": condition.get("stale_after_seconds"),
+            }
+        )
+    return summary
 
 
 class MonitorService:
@@ -728,7 +794,7 @@ class MonitorService:
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValidationError("idempotency_key must be non-empty")
         self._validate_rearm_of(rearm_of)
-        event_binding = event_condition_binding(condition)
+        event_condition_binding(condition)
 
         observer_context = self.observer_context_factory()
         async with self.app_server_factory() as app_server:
@@ -999,9 +1065,39 @@ class MonitorService:
         return None
 
     def _registration_response(self, record: MonitorRecord) -> dict[str, Any]:
-        response = self.status(record.monitor_id)
+        delivery = record.delivery or {}
+        origin_thread_id = (
+            str(delivery.get("origin_thread_id", ""))
+            if record.delivery_kind == DeliveryKind.THREAD
+            else record.target.thread_id if record.target is not None else ""
+        )
+        target_thread_id = (
+            str(delivery.get("thread_id", ""))
+            if record.delivery_kind == DeliveryKind.THREAD
+            else record.target.thread_id if record.target is not None else ""
+        )
+        compact_delivery = {
+            "kind": record.delivery_kind.value,
+            "origin_thread_id": origin_thread_id,
+            "target_thread_id": target_thread_id,
+        }
+        if delivery.get("delivery_id"):
+            compact_delivery["delivery_id"] = str(delivery["delivery_id"])
+        response: dict[str, Any] = {
+            "monitor_id": record.monitor_id,
+            "idempotency_key": record.idempotency_key,
+            "state": record.state.value,
+            "condition": _condition_binding_summary(record.condition),
+            "expires_at": record.expires_at,
+            "delivery": compact_delivery,
+            "supervision": (
+                "healthy" if daemon_is_healthy(self.root) else "unsupervised"
+            )
+            if record.state in {MonitorState.ARMED, MonitorState.CLAIMED}
+            else "not_required",
+        }
         if record.delivery_kind == DeliveryKind.THREAD:
-            caller_bound = (record.delivery or {}).get("origin_binding") == (
+            caller_bound = delivery.get("origin_binding") == (
                 "trusted_mcp_caller"
             )
             response["targeting"] = {
@@ -1020,6 +1116,12 @@ class MonitorService:
             }
         if record.state == MonitorState.ARMED:
             response["next_action"] = "end_current_turn"
+        elif record.outcome:
+            response["outcome"] = dict(record.outcome)
+        elif record.evidence:
+            response["evidence"] = dict(record.evidence)
+        if record.rearm_of is not None:
+            response["rearm_of"] = record.rearm_of
         receipts = self._receipt_instructions(record.condition)
         if receipts:
             response["receipt_instructions"] = receipts
@@ -1056,8 +1158,187 @@ class MonitorService:
             value["supervision"] = "not_required"
         return value
 
+    def decision_status(self, monitor_id: str) -> dict[str, Any]:
+        """Return the single-call report needed to decide what follows a wake."""
+
+        record = self.ledger.get(monitor_id)
+        if record is None:
+            raise ValidationError(f"unknown monitor: {monitor_id}")
+        report = record.outcome if isinstance(record.outcome, Mapping) else {}
+        wake_reason = (
+            record.wake_reason.value
+            if record.wake_reason is not None
+            else report.get("wake_reason")
+        )
+        value: dict[str, Any] = {
+            "monitor_id": record.monitor_id,
+            "state": record.state.value,
+        }
+        if wake_reason:
+            value["wake_reason"] = wake_reason
+
+        witness = report.get("witness")
+        if not isinstance(witness, list):
+            witness = list(record.witness)
+        if witness:
+            value["witness"] = witness
+            if any(item.get("task_success") is True for item in witness):
+                value["task_success"] = True
+            if any(item.get("task_success") is False for item in witness):
+                value["task_success"] = False
+            if any(item.get("lead_accepted") is False for item in witness):
+                value["lead_accepted"] = False
+
+        failure_detail = report.get("failure_detail")
+        if not isinstance(failure_detail, Mapping) and (
+            wake_reason == WakeReason.OBSERVER_FAILED.value
+        ):
+            failure_detail = record.evidence
+        if isinstance(failure_detail, Mapping) and failure_detail:
+            value["failure_detail"] = dict(failure_detail)
+
+        fired_at = report.get("fired_at")
+        if fired_at is None and wake_reason and record.admission_attempted_at is not None:
+            fired_at = record.admission_attempted_at
+        if fired_at is None and wake_reason and record.state == MonitorState.FIRED:
+            fired_at = report.get("at")
+        if record.armed_at is not None:
+            value["armed_at"] = record.armed_at
+        if fired_at is not None:
+            value["fired_at"] = fired_at
+        waited_seconds = report.get("waited_seconds")
+        if (
+            waited_seconds is None
+            and fired_at is not None
+            and record.armed_at is not None
+        ):
+            waited_seconds = max(0.0, float(fired_at) - record.armed_at)
+        if waited_seconds is not None:
+            value["waited_seconds"] = waited_seconds
+        value["evaluation_count"] = record.evaluation_count
+        value["avoided_poll_turns"] = (
+            report.get("avoided_poll_turns")
+            if report.get("avoided_poll_turns") is not None
+            else int(float(waited_seconds) // POLL_YIELD_FLOOR_SECONDS)
+            if waited_seconds is not None
+            else 0
+        )
+
+        delivery_source = record.delivery or {}
+        delivery: dict[str, Any] = {
+            "kind": record.delivery_kind.value,
+            "state": record.delivery_state or record.state.value,
+        }
+        if record.delivery_kind == DeliveryKind.THREAD:
+            delivery.update(
+                {
+                    "delivery_id": delivery_source.get("delivery_id"),
+                    "origin_thread_id": delivery_source.get("origin_thread_id"),
+                    "target_thread_id": delivery_source.get("thread_id"),
+                }
+            )
+        elif record.target is not None:
+            delivery.update(
+                {
+                    "origin_thread_id": record.target.thread_id,
+                    "target_thread_id": record.target.thread_id,
+                }
+            )
+        final_outcome = (
+            record.delivery_outcome
+            if isinstance(record.delivery_outcome, Mapping)
+            else report
+        )
+        classification = final_outcome.get("kind")
+        if not classification and isinstance(record.reconciliation, Mapping):
+            classification = record.reconciliation.get("classification")
+        if classification:
+            delivery["classification"] = classification
+        observed_count = final_outcome.get("observed_pointer_count")
+        if observed_count is None and isinstance(record.reconciliation, Mapping):
+            observed_count = record.reconciliation.get("observed_pointer_count")
+        if observed_count is not None:
+            delivery["observed_pointer_count"] = observed_count
+
+        if (
+            record.delivery_kind == DeliveryKind.THREAD
+            and record.delivery_state != ThreadDeliveryState.RECORDED.value
+        ):
+            diagnostic = {
+                key: item
+                for key, item in final_outcome.items()
+                if key
+                not in {
+                    "armed_at",
+                    "avoided_poll_turns",
+                    "evaluation_count",
+                    "fired_at",
+                    "journal_tail",
+                    "lead_accepted",
+                    "task_success",
+                    "waited_seconds",
+                    "wake_reason",
+                    "witness",
+                }
+                and item is not None
+                and item != []
+                and item != {}
+            }
+            if diagnostic:
+                delivery["diagnostic"] = diagnostic
+            if isinstance(record.reconciliation, Mapping):
+                reconciliation = {
+                    key: item
+                    for key, item in record.reconciliation.items()
+                    if item is not None and item != [] and item != {}
+                }
+                if reconciliation:
+                    delivery["reconciliation"] = reconciliation
+            if isinstance(record.queue_receipt, Mapping):
+                queue_receipt = {
+                    key: record.queue_receipt.get(key)
+                    for key in ("item_id", "client_user_message_id")
+                    if record.queue_receipt.get(key) is not None
+                }
+                if queue_receipt:
+                    delivery["queue_receipt"] = queue_receipt
+        value["delivery"] = {
+            key: item for key, item in delivery.items() if item is not None
+        }
+
+        try:
+            event = self.ledger.event_for_monitor(record.monitor_id)
+        except (ConflictError, ValidationError):
+            value["terminal_event"] = {
+                "state": "corrupt",
+                "lead_accepted": False,
+            }
+            value["task_success"] = False
+            value["lead_accepted"] = False
+        else:
+            if event is not None:
+                value["terminal_event"] = event.status_dict()
+                value["task_success"] = False
+                value["lead_accepted"] = False
+
+        journal, journal_dropped = compact_journal_tail(
+            record.condition, limit=DECISION_JOURNAL_TAIL_RUNS
+        )
+        if journal:
+            value["journal_tail"] = journal
+        if journal or journal_dropped:
+            value["journal_dropped"] = journal_dropped
+        chain = self._rearm_chain(record)
+        if chain:
+            value["rearm_chain"] = chain
+        if record.state in {MonitorState.ARMED, MonitorState.CLAIMED}:
+            value["supervision"] = (
+                "healthy" if daemon_is_healthy(self.root) else "unsupervised"
+            )
+        return value
+
     def list(self) -> list[dict[str, Any]]:
-        return [self.status(record.monitor_id) for record in self.ledger.list()]
+        return [self.decision_status(record.monitor_id) for record in self.ledger.list()]
 
     def cancel(self, monitor_id: str) -> dict[str, Any]:
         record = self.ledger.cancel(monitor_id)

@@ -24,11 +24,23 @@ The same idempotency key and semantically identical request MUST return the
 original monitor; reuse with a changed origin, delivery envelope, condition, or
 policy MUST be rejected.
 
+An armed registration response SHALL be a compact receipt containing monitor and
+idempotency identity, state, compact condition type/binding, expiry, origin and
+resolved root target, delivery kind, supervision, targeting, next action, and
+required receipt instructions. It MUST NOT embed the full capability snapshot or
+empty evidence, witness, outcome, delivery, or reconciliation structures. Full
+registration facts SHALL remain durable and available through audit status.
+
 #### Scenario: A main thread arms its own thread monitor
 - **WHEN** `wait_for_event` receives a trusted caller identity for an exact
   loaded or stored root main-thread and a supported condition
 - **THEN** the system returns a durable `ThreadDelivery` monitor targeted to
   that same root without creating, pausing, or activating a goal
+
+#### Scenario: An armed caller receives a compact handoff receipt
+- **WHEN** registration durably reaches `armed`
+- **THEN** its response contains enough identity, binding, expiry, targeting, and
+  supervision facts to end the current turn without returning the full audit row
 
 #### Scenario: A spawned subagent arms a thread monitor
 - **WHEN** `wait_for_event` receives a trusted caller identity for an exact
@@ -693,21 +705,44 @@ evidence: an ended turn is not task success.
 
 ### Requirement: Deliver a self-describing wake report
 
-For every fired monitor, durable status SHALL include wake reason, satisfying
-witness or failure detail, bounded log journal when applicable, arming/firing
-timestamps, evaluation count, and selected delivery facts. For terminal events it
-SHALL include redacted reservation/producer identity, event kind/status, bounded
-command or worker evidence, heartbeat facts, Git attestation, and explicit success
-and acceptance flags. The queued pointer SHALL identify the monitor but SHALL NOT
-duplicate this report or mutate a goal objective or other user-owned text.
-The report MUST distinguish task success, command termination, worker delivery
-candidate, invalid delivery, and heuristic stall.
+For every fired monitor, the default MCP `wake_me_up_status` decision view SHALL
+include wake reason, satisfying compact witness or observer failure detail,
+arming/firing/wait statistics, evaluation count, selected delivery identity and
+final classification, abnormal non-recorded diagnostics, re-arm chain when
+present, and bounded journal evidence. It SHALL be sufficient for the woken task
+to decide its next step after exactly one status call and MUST NOT require a
+second detail operation.
+
+The decision view SHALL omit nulls, empty containers, full capability snapshots,
+full queue receipts, normal recorded reconciliation history, duplicate
+`delivery_outcome`, and defaults without safety meaning. Its journal SHALL keep
+only a bounded newest set of distinct consecutive runs represented as
+`{"line":"...","repeat_count":N}` plus an explicit dropped count; the durable
+audit journal SHALL remain unchanged.
+
+For terminal events the decision view SHALL include redacted reservation and
+producer identity, event kind/status, bounded command or worker evidence,
+heartbeat facts, candidate and Git attestation, failure evidence, and explicit
+success and acceptance flags. The queued pointer SHALL identify the monitor,
+direct exactly one `view="decision"` read, state that it is not success, and
+SHALL NOT duplicate this report or mutate a goal objective or other user-owned
+text. The report MUST distinguish task success, command termination, worker
+delivery candidate, invalid delivery, and heuristic stall. Publish tokens,
+credentials, raw command arguments, and sensitive user text MUST remain absent.
+
+`wake_me_up_status(..., view="audit")` SHALL retain the full prior status
+semantics and durable forensic fields. One call SHALL select exactly one view.
 
 #### Scenario: Woken task reads context once
-- **WHEN** thread or goal delivery starts a later turn and the task requests status
-  once with the monitor ID
+- **WHEN** thread or goal delivery starts a later turn and the task requests
+  `wake_me_up_status` once with the monitor ID and `view="decision"`
 - **THEN** the response contains the wake reason, witness, wait statistics, and
   delivery receipt without further discovery
+
+#### Scenario: Operator requests full audit status
+- **WHEN** status is requested once with `view="audit"`
+- **THEN** it returns the complete durable status fields without changing the
+  model-facing decision projection
 
 #### Scenario: Lead wakes for worker delivery
 - **WHEN** a worker-terminal witness caused pointer or goal delivery
