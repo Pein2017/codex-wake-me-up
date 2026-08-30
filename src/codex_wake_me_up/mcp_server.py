@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -16,7 +16,9 @@ mcp = FastMCP(
     instructions=(
         "Use wait_for_event as the primary one-shot, host-local monitor for an "
         "exact task regardless of goal state; do not create a goal. After an "
-        "armed receipt, end the current turn. Choose defer_goal_until_event only "
+        "armed receipt, end the current turn. A terminal reservation returns a "
+        "monitor_condition to arm after its existing launcher starts the producer. "
+        "Choose defer_goal_until_event only "
         "for explicit legacy goal pause/reactivation. A queued wake is billed and "
         "is not a success claim; inspect durable status once after delivery."
     ),
@@ -37,7 +39,8 @@ def service() -> MonitorService:
         "Primary path: durably monitor one typed condition for one exact local "
         "Codex task, regardless of goal state. A fired monitor queues one small "
         "self-identifying pointer; queue delivery is billed and not exactly-once. "
-        "After an armed receipt, end the current turn."
+        "This asynchronously arms and returns immediately; it never launches or "
+        "joins a producer. After an armed receipt, end the current turn."
     ),
 )
 async def wait_for_event(
@@ -157,7 +160,7 @@ async def wake_me_up_defer(
     ),
 )
 def wake_me_up_status(
-    monitor_id: str, view: str = "decision"
+    monitor_id: str, view: Literal["decision", "audit"] = "decision"
 ) -> dict[str, Any]:
     if view == "decision":
         return service().decision_status(monitor_id)
@@ -186,7 +189,8 @@ def wake_me_up_publish_receipt(monitor_id: str, token: str, status: str) -> dict
     name="wake_me_up_event_reserve",
     description=(
         "Reserve one command/worker terminal event from a private mode-0600 JSON "
-        "payload. The raw publish token is returned only on first creation."
+        "payload. The raw publish token is returned only on first creation; the "
+        "non-secret monitor_condition is returned for a separate asynchronous arm."
     ),
 )
 def wake_me_up_event_reserve(payload_path: str) -> dict[str, Any]:

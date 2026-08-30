@@ -70,6 +70,7 @@ def test_legacy_heartbeat_is_healthy_but_not_event_capable(tmp_path) -> None:
 
 
 def test_daemon_heartbeat_advertises_exact_event_epoch_and_source(tmp_path) -> None:
+    assert EVENT_CAPABILITY_EPOCH == 2
     with DaemonLock(tmp_path):
         write_heartbeat(tmp_path)
 

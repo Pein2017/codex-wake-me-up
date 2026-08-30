@@ -18,7 +18,7 @@ from .conditions import (
     compact_journal_tail,
     contains_event_condition,
     elide_condition_journals,
-    event_condition_binding,
+    event_condition_bindings,
     evaluate_condition,
     journal_tail,
     observe_external_condition_leaves,
@@ -128,6 +128,20 @@ def _condition_binding_summary(condition: Mapping[str, Any]) -> dict[str, Any]:
             "armed_runtime_status",
         ):
             summary[key] = condition.get(key)
+    elif condition_type == "git_ref_change":
+        binding = condition.get("binding")
+        if isinstance(binding, Mapping):
+            for key in (
+                "worktree_root",
+                "common_dir",
+                "object_format",
+                "ref",
+                "direct_oid",
+                "peeled_commit",
+                "head_target",
+            ):
+                if binding.get(key) is not None:
+                    summary[key] = binding[key]
     elif condition_type in {"command_terminal", "worker_terminal"}:
         summary["reservation_id"] = condition.get("reservation_id")
     elif condition_type == "heartbeat_stale":
@@ -138,6 +152,99 @@ def _condition_binding_summary(condition: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
     return summary
+
+
+def _decision_terminal_payload(terminal: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = (
+        "kind",
+        "status",
+        "outcome",
+        "producer_task_id",
+        "command_digest",
+        "exit_code",
+        "signal",
+        "reason",
+        "candidate_oid",
+        "producer_at",
+        "host_received_at",
+        "log_paths",
+        "artifact_paths",
+    )
+    return {
+        **{
+            key: terminal.get(key)
+            for key in allowed
+            if terminal.get(key) is not None
+            and terminal.get(key) != []
+            and terminal.get(key) != {}
+        },
+        "task_success": False,
+        "lead_accepted": False,
+    }
+
+
+def _decision_heartbeat(heartbeat: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: heartbeat.get(key)
+        for key in ("sequence", "host_received_at")
+        if heartbeat.get(key) is not None
+    }
+
+
+def _decision_event_status(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep terminal decision facts while dropping audit-only and bearer data."""
+
+    value = {
+        key: event.get(key)
+        for key in ("reservation_id", "kind", "producer_id", "state")
+        if event.get(key) is not None
+    }
+    heartbeat = event.get("last_heartbeat")
+    if isinstance(heartbeat, Mapping):
+        compact_heartbeat = _decision_heartbeat(heartbeat)
+        if compact_heartbeat:
+            value["last_heartbeat"] = compact_heartbeat
+    terminal = event.get("terminal_event")
+    if isinstance(terminal, Mapping):
+        value["terminal_event"] = _decision_terminal_payload(terminal)
+    attestation = event.get("git_attestation")
+    if isinstance(attestation, Mapping) and attestation:
+        value["git_attestation"] = dict(attestation)
+    for key in ("cancelled_at", "expired_at"):
+        if event.get(key) is not None:
+            value[key] = event[key]
+    value["task_success"] = False
+    value["lead_accepted"] = False
+    return value
+
+
+def _decision_witness(item: Mapping[str, Any]) -> dict[str, Any]:
+    if item.get("type") not in {"command_terminal", "worker_terminal"}:
+        return dict(item)
+    value = {
+        key: item.get(key)
+        for key in (
+            "type",
+            "reservation_id",
+            "producer_id",
+            "classification",
+            "task_success",
+            "lead_accepted",
+        )
+        if item.get(key) is not None
+    }
+    terminal = item.get("terminal_event")
+    if isinstance(terminal, Mapping):
+        value["terminal_event"] = _decision_terminal_payload(terminal)
+    heartbeat = item.get("last_heartbeat")
+    if isinstance(heartbeat, Mapping):
+        compact_heartbeat = _decision_heartbeat(heartbeat)
+        if compact_heartbeat:
+            value["last_heartbeat"] = compact_heartbeat
+    attestation = item.get("git_attestation")
+    if isinstance(attestation, Mapping) and attestation:
+        value["git_attestation"] = dict(attestation)
+    return value
 
 
 class MonitorService:
@@ -173,6 +280,87 @@ class MonitorService:
         self.daemon_readiness = daemon_readiness
         self.event_daemon_readiness = event_daemon_readiness
         self.thread_delivery_readiness = thread_delivery_readiness
+
+    def _validate_event_replay(
+        self, record: MonitorRecord, condition: Mapping[str, Any]
+    ) -> None:
+        """Fail closed when a keyed replay no longer has its exact bindings."""
+
+        requested = event_condition_bindings(condition)
+        try:
+            stored = event_condition_bindings(record.condition)
+            actual = tuple(
+                (event.reservation_id, event.kind)
+                for event in self.ledger.events_for_monitor(record.monitor_id)
+            )
+        except (ConflictError, ValidationError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                "idempotent replay cannot validate the stored event binding set"
+            ) from exc
+        if requested != stored or actual != stored:
+            raise ValidationError(
+                "idempotent replay requires the exact event binding set"
+            )
+
+    def _terminal_status_fields(
+        self, record: MonitorRecord, *, decision: bool
+    ) -> dict[str, Any]:
+        """Project singular legacy or plural terminal evidence without duplication."""
+
+        try:
+            expected = event_condition_bindings(record.condition)
+        except ValidationError:
+            expected = ()
+        if not expected and not contains_event_condition(record.condition):
+            return {}
+        expected_ids = [reservation_id for reservation_id, _kind in expected]
+        try:
+            events = self.ledger.events_for_monitor(record.monitor_id)
+            actual = tuple((event.reservation_id, event.kind) for event in events)
+        except (ConflictError, ValidationError, TypeError, ValueError):
+            events = []
+            actual = ()
+        if not expected or actual != expected:
+            evidence = record.evidence if isinstance(record.evidence, Mapping) else {}
+            marker = {
+                "state": "corrupt",
+                "expected_reservation_ids": evidence.get(
+                    "expected_reservation_ids", expected_ids
+                ),
+                "observed_reservation_ids": evidence.get(
+                    "observed_reservation_ids",
+                    [event.reservation_id for event in events],
+                ),
+                "task_success": False,
+                "lead_accepted": False,
+            }
+            if len(expected) == 1:
+                return {"terminal_event": marker}
+            return {"terminal_events": [marker]}
+
+        rendered: list[dict[str, Any]] = []
+        witness_ids = {
+            str(item.get("reservation_id"))
+            for item in record.witness
+            if isinstance(item, Mapping) and item.get("reservation_id")
+        }
+        for event in events:
+            status = event.status_dict()
+            if decision and len(events) > 1:
+                abnormal = (
+                    status.get("terminal_event") is not None
+                    or status.get("git_attestation") is not None
+                    or status.get("cancelled_at") is not None
+                    or status.get("expired_at") is not None
+                )
+                if event.reservation_id not in witness_ids and not abnormal:
+                    continue
+            rendered.append(
+                _decision_event_status(status) if decision else status
+            )
+        if len(expected) == 1:
+            return {"terminal_event": rendered[0]}
+        return {"terminal_events": rendered} if rendered else {}
 
     async def wait_for_current_event(
         self,
@@ -243,13 +431,14 @@ class MonitorService:
                 raise ValidationError(
                     "idempotency key already belongs to a monitor with different semantics"
                 )
+            self._validate_event_replay(existing, condition)
             return self._registration_response(existing)
         if not self.thread_delivery_readiness(self.root):
             raise ValidationError(
                 "thread delivery requires an exact delivery-capable daemon before arming"
             )
-        event_binding = event_condition_binding(condition)
-        if event_binding is not None and not self.event_daemon_readiness(self.root):
+        event_bindings = event_condition_bindings(condition)
+        if event_bindings and not self.event_daemon_readiness(self.root):
             raise ValidationError(
                 "event monitor requires an exact event-capable daemon before arming"
             )
@@ -292,7 +481,7 @@ class MonitorService:
             monitor_id=monitor_id,
             receipt_token=receipt_token,
         )
-        prepared_event_binding = event_condition_binding(prepared_condition)
+        prepared_event_bindings = event_condition_bindings(prepared_condition)
         record, _created = self.ledger.create_or_get(
             monitor_id=monitor_id,
             idempotency_key=idempotency_key,
@@ -303,16 +492,7 @@ class MonitorService:
             allow_heuristic_continuation=False,
             expires_at=observer_context.now() + float(expires_in_seconds),
             rearm_of=rearm_of,
-            event_reservation_id=(
-                prepared_event_binding[0]
-                if prepared_event_binding is not None
-                else None
-            ),
-            event_kind=(
-                prepared_event_binding[1]
-                if prepared_event_binding is not None
-                else None
-            ),
+            event_bindings=prepared_event_bindings,
             now=observer_context.now(),
         )
         if not self.thread_delivery_readiness(self.root):
@@ -381,6 +561,10 @@ class MonitorService:
             now=observed_at,
         )
         response = record.status_dict()
+        response["monitor_condition"] = {
+            "type": record.kind,
+            "reservation_id": record.reservation_id,
+        }
         response["created"] = created
         if created:
             response["publish_token"] = publish_token
@@ -403,7 +587,13 @@ class MonitorService:
         record = self.ledger.get_event(reservation_id)
         if record is None:
             raise ValidationError(f"unknown event reservation: {reservation_id}")
-        return record.status_dict()
+        return {
+            **record.status_dict(),
+            "monitor_condition": {
+                "type": record.kind,
+                "reservation_id": record.reservation_id,
+            },
+        }
 
     def cancel_terminal_event(self, reservation_id: str) -> dict[str, Any]:
         return self.ledger.cancel_event(reservation_id).status_dict()
@@ -615,9 +805,6 @@ class MonitorService:
         ):
             report["task_success"] = False
             report["lead_accepted"] = False
-            event = self.ledger.event_for_monitor(record.monitor_id)
-            if event is not None:
-                report["terminal_event"] = event.status_dict()
         tail = journal_tail(record.condition, limit=WAKE_JOURNAL_TAIL_LINES)
         if tail:
             report["journal_tail"] = tail
@@ -647,8 +834,8 @@ class MonitorService:
         if idempotency_key is not None and not idempotency_key:
             raise ValidationError("idempotency_key must be non-empty when provided")
         self._validate_rearm_of(rearm_of)
-        event_binding = event_condition_binding(condition)
-        if event_binding is not None and not self.event_daemon_readiness(self.root):
+        event_bindings = event_condition_bindings(condition)
+        if event_bindings and not self.event_daemon_readiness(self.root):
             raise ValidationError(
                 "event monitor requires an exact event-capable daemon before arming"
             )
@@ -689,6 +876,7 @@ class MonitorService:
                         raise ValidationError(
                             "idempotency key already belongs to a monitor with different semantics"
                         )
+                    self._validate_event_replay(existing, condition)
                     record = existing
                     if start_daemon and record.state == MonitorState.ARMED:
                         self.daemon_starter(self.root)
@@ -704,7 +892,7 @@ class MonitorService:
                 monitor_id=monitor_id,
                 receipt_token=receipt_token,
             )
-            prepared_event_binding = event_condition_binding(prepared_condition)
+            prepared_event_bindings = event_condition_bindings(prepared_condition)
             record, created = self.ledger.create_or_get(
                 monitor_id=monitor_id,
                 idempotency_key=idempotency_key,
@@ -714,23 +902,14 @@ class MonitorService:
                 allow_heuristic_continuation=allow_heuristic_continuation,
                 expires_at=observer_context.now() + float(expires_in_seconds),
                 rearm_of=rearm_of,
-                event_reservation_id=(
-                    prepared_event_binding[0]
-                    if prepared_event_binding is not None
-                    else None
-                ),
-                event_kind=(
-                    prepared_event_binding[1]
-                    if prepared_event_binding is not None
-                    else None
-                ),
+                event_bindings=prepared_event_bindings,
                 now=observer_context.now(),
             )
             if created:
                 second = await app_server.read_observation(thread_id)
                 if self._same_guard(first, second):
                     if (
-                        prepared_event_binding is not None
+                        prepared_event_bindings
                         and not self.event_daemon_readiness(self.root)
                     ):
                         unavailable = self.ledger.transition(
@@ -794,7 +973,7 @@ class MonitorService:
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValidationError("idempotency_key must be non-empty")
         self._validate_rearm_of(rearm_of)
-        event_condition_binding(condition)
+        event_condition_bindings(condition)
 
         observer_context = self.observer_context_factory()
         async with self.app_server_factory() as app_server:
@@ -826,6 +1005,7 @@ class MonitorService:
                     raise ValidationError(
                         "idempotency key already belongs to a monitor with different semantics"
                     )
+                self._validate_event_replay(existing, condition)
                 response = self._registration_response(existing)
                 if existing.state == MonitorState.ARMED:
                     response["next_action"] = "end_current_turn"
@@ -846,7 +1026,7 @@ class MonitorService:
                 monitor_id=monitor_id,
                 receipt_token=receipt_token,
             )
-            prepared_event_binding = event_condition_binding(prepared_condition)
+            prepared_event_bindings = event_condition_bindings(prepared_condition)
             try:
                 protocol_lock = DeferProtocolLock(self.root)
                 protocol_lock.__enter__()
@@ -865,16 +1045,7 @@ class MonitorService:
                     idle_barrier=True,
                     initial_state=MonitorState.DEFER_INTENT,
                     rearm_of=rearm_of,
-                    event_reservation_id=(
-                        prepared_event_binding[0]
-                        if prepared_event_binding is not None
-                        else None
-                    ),
-                    event_kind=(
-                        prepared_event_binding[1]
-                        if prepared_event_binding is not None
-                        else None
-                    ),
+                    event_bindings=prepared_event_bindings,
                     now=observer_context.now(),
                 )
                 if not created:
@@ -886,7 +1057,7 @@ class MonitorService:
                 try:
                     ready = (
                         self.event_daemon_readiness(self.root)
-                        if prepared_event_binding is not None
+                        if prepared_event_bindings
                         else self.daemon_readiness(self.root)
                     )
                 except Exception as exc:
@@ -1138,18 +1309,11 @@ class MonitorService:
         chain = self._rearm_chain(record)
         if chain:
             value["rearm_chain"] = chain
-        try:
-            event = self.ledger.event_for_monitor(record.monitor_id)
-        except (ConflictError, ValidationError):
-            value["terminal_event"] = {
-                "state": "corrupt",
-                "lead_accepted": False,
-            }
+        terminal_fields = self._terminal_status_fields(record, decision=False)
+        if terminal_fields:
+            value.update(terminal_fields)
+            value["task_success"] = False
             value["lead_accepted"] = False
-        else:
-            if event is not None:
-                value["terminal_event"] = event.status_dict()
-                value["lead_accepted"] = False
         if record.state in {MonitorState.ARMED, MonitorState.CLAIMED}:
             value["supervision"] = (
                 "healthy" if daemon_is_healthy(self.root) else "unsupervised"
@@ -1181,6 +1345,11 @@ class MonitorService:
         if not isinstance(witness, list):
             witness = list(record.witness)
         if witness:
+            witness = [
+                _decision_witness(item)
+                for item in witness
+                if isinstance(item, Mapping)
+            ]
             value["witness"] = witness
             if any(item.get("task_success") is True for item in witness):
                 value["task_success"] = True
@@ -1306,20 +1475,11 @@ class MonitorService:
             key: item for key, item in delivery.items() if item is not None
         }
 
-        try:
-            event = self.ledger.event_for_monitor(record.monitor_id)
-        except (ConflictError, ValidationError):
-            value["terminal_event"] = {
-                "state": "corrupt",
-                "lead_accepted": False,
-            }
+        terminal_fields = self._terminal_status_fields(record, decision=True)
+        if terminal_fields:
+            value.update(terminal_fields)
             value["task_success"] = False
             value["lead_accepted"] = False
-        else:
-            if event is not None:
-                value["terminal_event"] = event.status_dict()
-                value["task_success"] = False
-                value["lead_accepted"] = False
 
         journal, journal_dropped = compact_journal_tail(
             record.condition, limit=DECISION_JOURNAL_TAIL_RUNS
@@ -1577,8 +1737,8 @@ class MonitorService:
         if contains_event_condition(record.condition):
             contract_error: str | None = None
             try:
-                event_binding = event_condition_binding(record.condition)
-                if event_binding is None:
+                event_bindings = event_condition_bindings(record.condition)
+                if not event_bindings:
                     raise ValidationError(
                         "event condition contains no bindable reservation"
                     )

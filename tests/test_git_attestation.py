@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import codex_wake_me_up.git_attestation as git_attestation
-from codex_wake_me_up.git_attestation import attest_candidate, capture_worktree_scope
+from codex_wake_me_up.git_attestation import (
+    attest_candidate,
+    capture_git_ref,
+    capture_worktree_scope,
+    sample_git_ref,
+)
 
 
 def git(repository: Path, *args: str) -> str:
@@ -299,3 +305,279 @@ def test_repository_identity_is_rechecked_after_path_scan(
 
     assert attest_candidate(frozen, candidate).status == "valid"
     assert calls == 2
+
+
+def test_git_ref_capture_and_fast_forward_are_exact_and_read_only(repository: Path) -> None:
+    before = snapshot_git_state(repository)
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+    old_oid = binding.direct_oid
+    old_commit = binding.peeled_commit
+    head_target = git(repository, "symbolic-ref", "HEAD")
+
+    unchanged = sample_git_ref(binding)
+    assert unchanged.classification == "unchanged"
+    assert unchanged.changed is False
+    assert unchanged.error is None
+    assert unchanged.coalesced is False
+
+    write(repository, "allowed/next.txt", "next\n")
+    new_commit = commit(repository, "next")
+    after_commit = snapshot_git_state(repository)
+    result = sample_git_ref(binding)
+
+    assert binding.worktree_root == str(repository.resolve())
+    assert Path(binding.common_dir).is_absolute()
+    assert Path(binding.git_dir).is_absolute()
+    assert binding.ref == "HEAD"
+    assert binding.head_target == head_target
+    assert binding.direct_oid == old_oid == old_commit
+    assert result.classification == "fast_forward"
+    assert result.changed is True
+    assert result.old_direct_oid == old_oid
+    assert result.new_direct_oid == new_commit
+    assert result.old_peeled_commit == old_commit
+    assert result.new_peeled_commit == new_commit
+    assert result.ancestry == "descendant"
+    assert result.coalesced is True
+    assert result.error is None
+    assert snapshot_git_state(repository) == after_commit
+    assert before["remote"] == after_commit["remote"]
+
+
+def test_git_ref_classifies_rewrite_delete_and_head_retarget(repository: Path) -> None:
+    baseline = git(repository, "rev-parse", "HEAD")
+    git(repository, "branch", "watched")
+    branch_binding = capture_git_ref(worktree=repository, ref="refs/heads/watched")
+
+    write(repository, "allowed/main.txt", "main\n")
+    commit(repository, "main")
+    git(repository, "checkout", "--orphan", "other")
+    git(repository, "rm", "-rf", ".")
+    write(repository, "allowed/other.txt", "other\n")
+    unrelated = commit(repository, "other")
+    git(repository, "update-ref", "refs/heads/watched", unrelated)
+
+    rewritten = sample_git_ref(branch_binding)
+    assert rewritten.classification == "ref_rewrite"
+    assert rewritten.ancestry == "diverged"
+    assert rewritten.old_peeled_commit == baseline
+    assert rewritten.new_peeled_commit == unrelated
+
+    git(repository, "update-ref", "-d", "refs/heads/watched")
+    deleted = sample_git_ref(branch_binding)
+    assert deleted.classification == "ref_deleted"
+    assert deleted.new_direct_oid is None
+    assert deleted.ancestry == "deleted"
+
+    head_binding = capture_git_ref(worktree=repository, ref="HEAD")
+    current = git(repository, "rev-parse", "HEAD")
+    git(repository, "checkout", "--detach", current)
+
+    retargeted = sample_git_ref(head_binding)
+    assert retargeted.classification == "head_retarget"
+    assert retargeted.old_head_target is not None
+    assert retargeted.new_head_target is None
+    assert retargeted.old_direct_oid == retargeted.new_direct_oid == current
+    assert retargeted.ancestry == "same"
+
+
+def test_git_ref_direct_object_rewrite_with_same_peeled_commit(repository: Path) -> None:
+    commit_oid = git(repository, "rev-parse", "HEAD")
+    git(repository, "tag", "-a", "one", "-m", "one", commit_oid)
+    git(repository, "tag", "-a", "two", "-m", "two", commit_oid)
+    tag_one = git(repository, "rev-parse", "refs/tags/one")
+    tag_two = git(repository, "rev-parse", "refs/tags/two")
+    git(repository, "update-ref", "refs/tags/watched", tag_one)
+    binding = capture_git_ref(worktree=repository, ref="refs/tags/watched")
+
+    git(repository, "update-ref", "refs/tags/watched", tag_two)
+    result = sample_git_ref(binding)
+
+    assert tag_one != tag_two
+    assert result.classification == "ref_rewrite"
+    assert result.old_direct_oid == tag_one
+    assert result.new_direct_oid == tag_two
+    assert result.old_peeled_commit == result.new_peeled_commit == commit_oid
+    assert result.ancestry == "same"
+
+
+@pytest.mark.parametrize(
+    "ref",
+    (
+        "main",
+        "HEAD~1",
+        "refs/heads/main^{commit}",
+        "refs/remotes/origin/main",
+        "refs/heads/../main",
+        "refs/heads/missing",
+    ),
+)
+def test_git_ref_capture_rejects_non_direct_remote_or_absent_refs(repository: Path, ref: str) -> None:
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=repository, ref=ref)
+
+
+def test_git_ref_rejects_non_head_symbolic_refs_at_capture_and_revalidation(
+    repository: Path,
+) -> None:
+    git(repository, "branch", "watched")
+    git(repository, "branch", "other")
+    binding = capture_git_ref(worktree=repository, ref="refs/heads/watched")
+
+    git(repository, "symbolic-ref", "refs/heads/watched", "refs/heads/other")
+
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=repository, ref="refs/heads/watched")
+    sample = sample_git_ref(binding)
+    assert sample.classification == "observer_error"
+    assert sample.error == "invalid_binding"
+
+
+def test_git_ref_capture_rejects_relative_nonroot_unborn_and_noncommit(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relative = Path(repository.name)
+    monkeypatch.chdir(repository.parent)
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=relative, ref="HEAD")
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=repository / "allowed", ref="HEAD")
+
+    unborn = tmp_path / "unborn"
+    git(tmp_path, "init", str(unborn))
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=unborn, ref="HEAD")
+
+    blob = git(repository, "hash-object", "-w", "allowed/base.txt")
+    git(repository, "update-ref", "refs/tags/blob", blob)
+    with pytest.raises(ValueError):
+        capture_git_ref(worktree=repository, ref="refs/tags/blob")
+
+
+def test_git_ref_sample_fails_closed_for_repository_replacement(
+    repository: Path, tmp_path: Path
+) -> None:
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+    moved = tmp_path / "moved"
+    repository.rename(moved)
+    git(tmp_path, "init", str(repository))
+    git(repository, "config", "user.name", "Test User")
+    git(repository, "config", "user.email", "test@example.invalid")
+    write(repository, "replacement.txt", "replacement\n")
+    commit(repository, "replacement")
+
+    result = sample_git_ref(binding)
+
+    assert result.classification == "observer_error"
+    assert result.changed is False
+    assert result.error == "repository_identity_changed"
+    assert result.new_direct_oid is None
+
+
+def test_git_ref_sample_scrubs_git_parse_resolution_and_race_errors(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+
+    monkeypatch.setattr(
+        git_attestation,
+        "_read_git_ref",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(git_attestation._GitFailure("secret stderr")),
+    )
+    failed = sample_git_ref(binding)
+    assert failed.classification == "observer_error"
+    assert failed.error == "git_failed"
+    assert "secret" not in repr(failed)
+
+    monkeypatch.undo()
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+    original = git_attestation._read_git_ref
+    calls = 0
+
+    def raced(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        state = original(*args, **kwargs)
+        if calls == 2:
+            return git_attestation._RawGitRef(
+                direct_oid="0" * len(state.direct_oid),
+                peeled_commit=state.peeled_commit,
+                head_target=state.head_target,
+            )
+        return state
+
+    monkeypatch.setattr(git_attestation, "_read_git_ref", raced)
+    raced_result = sample_git_ref(binding)
+    assert raced_result.classification == "observer_error"
+    assert raced_result.error == "observation_race"
+
+
+def test_git_ref_sample_fails_closed_for_object_format_parse_and_resolution_errors(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git(repository, "branch", "watched")
+    binding = capture_git_ref(worktree=repository, ref="refs/heads/watched")
+    original_discover = git_attestation._discover_repository
+
+    def wrong_format(root: Path):
+        worktree, common, _object_format = original_discover(root)
+        return worktree, common, "sha256"
+
+    monkeypatch.setattr(git_attestation, "_discover_repository", wrong_format)
+    mismatch = sample_git_ref(binding)
+    assert mismatch.classification == "observer_error"
+    assert mismatch.error == "repository_identity_changed"
+
+    monkeypatch.undo()
+    binding = capture_git_ref(worktree=repository, ref="refs/heads/watched")
+    original_git = git_attestation._git
+
+    def malformed(root: Path, *arguments: str, **kwargs):
+        completed = original_git(root, *arguments, **kwargs)
+        if arguments[:3] == ("show-ref", "--verify", "--hash"):
+            return subprocess.CompletedProcess(completed.args, 0, b"not-an-oid\n", b"")
+        return completed
+
+    monkeypatch.setattr(git_attestation, "_git", malformed)
+    malformed_result = sample_git_ref(binding)
+    assert malformed_result.classification == "observer_error"
+    assert malformed_result.error == "malformed_git_output"
+
+    monkeypatch.undo()
+    git(repository, "update-ref", "refs/tags/watched", git(repository, "rev-parse", "HEAD"))
+    binding = capture_git_ref(worktree=repository, ref="refs/tags/watched")
+    blob = git(repository, "hash-object", "-w", "allowed/base.txt")
+    git(repository, "update-ref", "refs/tags/watched", blob)
+    unresolvable = sample_git_ref(binding)
+    assert unresolvable.classification == "observer_error"
+    assert unresolvable.error == "ref_unresolvable"
+
+
+def test_git_ref_sample_fails_closed_for_post_read_identity_race(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+    original = git_attestation._verify_git_ref_binding
+    calls = 0
+
+    def identity_race(binding_value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise git_attestation._GitRefIdentityFailure("secret replacement detail")
+        return original(binding_value)
+
+    monkeypatch.setattr(git_attestation, "_verify_git_ref_binding", identity_race)
+    result = sample_git_ref(binding)
+    assert result.classification == "observer_error"
+    assert result.error == "repository_identity_changed"
+    assert "secret" not in repr(result)
+
+
+def test_git_ref_sample_rejects_malformed_stored_binding(repository: Path) -> None:
+    binding = capture_git_ref(worktree=repository, ref="HEAD")
+
+    result = sample_git_ref(replace(binding, direct_oid="HEAD"))
+
+    assert result.classification == "observer_error"
+    assert result.error == "invalid_binding"

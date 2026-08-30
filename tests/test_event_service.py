@@ -543,3 +543,268 @@ def test_corrupt_persisted_event_snapshot_gets_one_observer_failure_wake(
     assert status["evaluation_count"] == 1
     assert status["terminal_event"]["state"] == "corrupt"
     assert len(app_server.activation_calls) == 1
+
+
+def test_reservation_receipt_returns_only_the_non_secret_monitor_condition(
+    tmp_path,
+) -> None:
+    monitor_service = service(tmp_path, FakeAppServer([observation()]), Clock())
+
+    created = monitor_service.reserve_terminal_event(command_reservation())
+    replay = monitor_service.reserve_terminal_event(command_reservation())
+
+    expected = {
+        "type": "command_terminal",
+        "reservation_id": created["reservation_id"],
+    }
+    assert created["monitor_condition"] == expected
+    assert replay["monitor_condition"] == expected
+    assert "publish_token" not in replay
+    assert "publisher_descriptor" not in json.dumps(expected)
+
+
+def test_all_terminal_reservations_fire_once_with_plural_decision_evidence(
+    tmp_path,
+) -> None:
+    clock = Clock()
+    app_server = FakeAppServer(
+        [observation(), observation(), observation(runtime_status="idle")]
+    )
+    monitor_service = service(tmp_path, app_server, clock)
+    first = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "command-launch-a",
+            "producer_identity": "shell-a",
+        }
+    )
+    second = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "command-launch-b",
+            "producer_identity": "shell-b",
+        }
+    )
+
+    registered = asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition={
+                "type": "all",
+                "children": [
+                    first["monitor_condition"],
+                    second["monitor_condition"],
+                ],
+            },
+            expires_in_seconds=100,
+            start_daemon=False,
+        )
+    )
+    for reservation in (first, second):
+        assert monitor_service.event_status(reservation["reservation_id"])[
+            "bound_monitor_id"
+        ] == registered["monitor_id"]
+
+    monitor_service.publish_terminal_event(
+        first["reservation_id"],
+        publish_token=first["publish_token"],
+        terminal_event=command_terminal(status="succeeded", exit_code=0),
+    )
+    asyncio.run(monitor_service.reconcile_once())
+    assert monitor_service.status(registered["monitor_id"])["state"] == "armed"
+    assert app_server.activation_calls == []
+
+    monitor_service.publish_terminal_event(
+        second["reservation_id"],
+        publish_token=second["publish_token"],
+        terminal_event=command_terminal(status="failed", exit_code=7),
+    )
+    asyncio.run(monitor_service.reconcile_once())
+
+    decision = monitor_service.decision_status(registered["monitor_id"])
+    audit = monitor_service.status(registered["monitor_id"])
+    expected_ids = sorted([first["reservation_id"], second["reservation_id"]])
+    assert decision["state"] == "fired"
+    assert [item["reservation_id"] for item in decision["terminal_events"]] == (
+        expected_ids
+    )
+    assert [item["reservation_id"] for item in audit["terminal_events"]] == expected_ids
+    assert "terminal_event" not in decision
+    assert "terminal_event" not in audit
+    assert decision["task_success"] is False
+    assert decision["lead_accepted"] is False
+    assert "publish_token" not in json.dumps(decision)
+    assert len(app_server.activation_calls) == 1
+
+
+def test_settlement_uncertain_wakes_with_false_flags_and_no_candidate(
+    tmp_path,
+) -> None:
+    repository = tmp_path / "repo"
+    git(tmp_path, "init", str(repository))
+    git(repository, "config", "user.name", "Test User")
+    git(repository, "config", "user.email", "test@example.invalid")
+    baseline = git_commit(repository, "allowed/base.txt", "base\n", "baseline")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    app_server = FakeAppServer(
+        [observation(), observation(), observation(runtime_status="idle")]
+    )
+    monitor_service = service(runtime, app_server, Clock())
+    reserved = monitor_service.reserve_terminal_event(
+        {
+            "kind": "worker_terminal",
+            "expires_in_seconds": 100,
+            "producer_task_id": "worker-uncertain",
+            "repository": str(repository / ".git"),
+            "worktree": str(repository),
+            "baseline_commit": baseline,
+            "allowed_path_prefixes": ["allowed"],
+        }
+    )
+    registered = asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition=reserved["monitor_condition"],
+            expires_in_seconds=100,
+            start_daemon=False,
+        )
+    )
+
+    monitor_service.publish_terminal_event(
+        reserved["reservation_id"],
+        publish_token=reserved["publish_token"],
+        terminal_event={
+            "kind": "worker_terminal",
+            "outcome": "settlement_uncertain",
+            "producer_task_id": "worker-uncertain",
+            "reason": "driver_unverifiable",
+        },
+    )
+    asyncio.run(monitor_service.reconcile_once())
+
+    decision = monitor_service.decision_status(registered["monitor_id"])
+    terminal = decision["terminal_event"]["terminal_event"]
+    assert terminal["outcome"] == "settlement_uncertain"
+    assert terminal["reason"] == "driver_unverifiable"
+    assert "candidate_oid" not in terminal
+    assert decision["task_success"] is False
+    assert decision["lead_accepted"] is False
+    assert len(app_server.activation_calls) == 1
+
+
+def test_keyed_replay_rejects_a_missing_member_before_returning_receipt(
+    tmp_path,
+) -> None:
+    app_server = FakeAppServer([observation(), observation(), observation()])
+    monitor_service = service(tmp_path, app_server, Clock())
+    first = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "replay-reservation-a",
+            "producer_identity": "producer-a",
+        }
+    )
+    second = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "replay-reservation-b",
+            "producer_identity": "producer-b",
+        }
+    )
+    condition = {
+        "type": "all",
+        "children": [first["monitor_condition"], second["monitor_condition"]],
+    }
+    asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition=condition,
+            expires_in_seconds=100,
+            idempotency_key="replay-monitor",
+            start_daemon=False,
+        )
+    )
+    monitor_service.ledger._connection.execute(
+        "DELETE FROM event_reservations WHERE reservation_id = ?",
+        (second["reservation_id"],),
+    )
+    monitor_service.ledger._connection.commit()
+
+    with pytest.raises(ValidationError, match="exact event binding set"):
+        asyncio.run(
+            monitor_service.register(
+                thread_id="test-thread",
+                condition=condition,
+                expires_in_seconds=100,
+                idempotency_key="replay-monitor",
+                start_daemon=False,
+            )
+        )
+
+
+def test_missing_plural_member_is_self_describing_in_one_failure_status(
+    tmp_path,
+) -> None:
+    app_server = FakeAppServer(
+        [observation(), observation(), observation(runtime_status="idle")]
+    )
+    monitor_service = service(tmp_path, app_server, Clock())
+    first = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "missing-reservation-a",
+            "producer_identity": "producer-a",
+        }
+    )
+    second = monitor_service.reserve_terminal_event(
+        {
+            **command_reservation(),
+            "idempotency_key": "missing-reservation-b",
+            "producer_identity": "producer-b",
+        }
+    )
+    registered = asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition={
+                "type": "all",
+                "children": [
+                    first["monitor_condition"],
+                    second["monitor_condition"],
+                ],
+            },
+            expires_in_seconds=100,
+            start_daemon=False,
+        )
+    )
+    monitor_service.ledger._connection.execute(
+        "UPDATE monitors SET mode = 'deferred', idle_barrier = 1 WHERE monitor_id = ?",
+        (registered["monitor_id"],),
+    )
+    monitor_service.ledger._connection.execute(
+        "DELETE FROM event_reservations WHERE reservation_id = ?",
+        (second["reservation_id"],),
+    )
+    monitor_service.ledger._connection.commit()
+
+    asyncio.run(monitor_service.reconcile_once())
+
+    decision = monitor_service.decision_status(registered["monitor_id"])
+    expected_ids = sorted([first["reservation_id"], second["reservation_id"]])
+    assert decision["state"] == "fired"
+    assert decision["wake_reason"] == "observer_failed"
+    assert decision["failure_detail"]["expected_reservation_ids"] == expected_ids
+    assert decision["failure_detail"]["observed_reservation_ids"] == [
+        first["reservation_id"]
+    ]
+    assert decision["terminal_events"] == [
+        {
+            "state": "corrupt",
+            "expected_reservation_ids": expected_ids,
+            "observed_reservation_ids": [first["reservation_id"]],
+            "task_success": False,
+            "lead_accepted": False,
+        }
+    ]
+    assert len(app_server.activation_calls) == 1

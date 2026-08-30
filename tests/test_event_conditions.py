@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from codex_wake_me_up.conditions import (
-    event_condition_binding,
+    event_condition_bindings,
     evaluate_event_condition_tree,
     witness_authorizes_continuation,
 )
@@ -12,13 +12,14 @@ from codex_wake_me_up.models import TriState, ValidationError
 
 def event_status(
     *,
+    reservation_id: str = "event-1",
     kind: str = "command_terminal",
     terminal_event: dict | None = None,
     heartbeat: dict | None = None,
     attestation: dict | None = None,
 ) -> dict:
     return {
-        "reservation_id": "event-1",
+        "reservation_id": reservation_id,
         "kind": kind,
         "producer_id": "producer-1",
         "state": "terminal" if terminal_event else "bound",
@@ -29,7 +30,7 @@ def event_status(
     }
 
 
-def test_event_binding_allows_one_terminal_and_shared_heartbeat_leaves() -> None:
+def test_event_bindings_are_canonical_and_allow_shared_heartbeat_leaves() -> None:
     condition = {
         "type": "any",
         "children": [
@@ -41,10 +42,32 @@ def test_event_binding_allows_one_terminal_and_shared_heartbeat_leaves() -> None
             },
         ],
     }
-    assert event_condition_binding(condition) == ("event-1", "command_terminal")
+    assert event_condition_bindings(condition) == (("event-1", "command_terminal"),)
+
+    composed = {
+        "type": "all",
+        "children": [
+            {"type": "worker_terminal", "reservation_id": "event-2"},
+            {
+                "type": "any",
+                "children": [
+                    {"type": "command_terminal", "reservation_id": "event-1"},
+                    {
+                        "type": "heartbeat_stale",
+                        "reservation_id": "event-2",
+                        "stale_after_seconds": 60,
+                    },
+                ],
+            },
+        ],
+    }
+    assert event_condition_bindings(composed) == (
+        ("event-1", "command_terminal"),
+        ("event-2", "worker_terminal"),
+    )
 
     with pytest.raises(ValidationError, match="duplicate terminal"):
-        event_condition_binding(
+        event_condition_bindings(
             {
                 "type": "all",
                 "children": [
@@ -53,8 +76,8 @@ def test_event_binding_allows_one_terminal_and_shared_heartbeat_leaves() -> None
                 ],
             }
         )
-    with pytest.raises(ValidationError, match="one distinct reservation"):
-        event_condition_binding(
+    with pytest.raises(ValidationError, match="matching terminal leaf"):
+        event_condition_bindings(
             {
                 "type": "all",
                 "children": [
@@ -69,6 +92,21 @@ def test_event_binding_allows_one_terminal_and_shared_heartbeat_leaves() -> None
         )
 
 
+def test_event_bindings_reject_kind_conflicts_and_malformed_children() -> None:
+    with pytest.raises(ValidationError, match="duplicate terminal"):
+        event_condition_bindings(
+            {
+                "type": "any",
+                "children": [
+                    {"type": "command_terminal", "reservation_id": "event-1"},
+                    {"type": "worker_terminal", "reservation_id": "event-1"},
+                ],
+            }
+        )
+    with pytest.raises(ValidationError, match="child must be an object"):
+        event_condition_bindings({"type": "all", "children": [None]})
+
+
 def test_command_terminal_truth_is_handling_evidence_not_task_success() -> None:
     condition = {"type": "command_terminal", "reservation_id": "event-1"}
     status = event_status(
@@ -80,7 +118,9 @@ def test_command_terminal_truth_is_handling_evidence_not_task_success() -> None:
         }
     )
 
-    evaluation = evaluate_event_condition_tree(condition, status, now=100.0)
+    evaluation = evaluate_event_condition_tree(
+        condition, {"event-1": status}, now=100.0
+    )
 
     assert evaluation.value is TriState.TRUE
     assert evaluation.witness[0]["classification"] == "command_termination"
@@ -111,7 +151,9 @@ def test_worker_delivery_wakes_for_valid_and_invalid_attestation(
         attestation={"status": attestation_status, "lead_accepted": False},
     )
 
-    evaluation = evaluate_event_condition_tree(condition, status, now=100.0)
+    evaluation = evaluate_event_condition_tree(
+        condition, {"event-1": status}, now=100.0
+    )
 
     assert evaluation.value is TriState.TRUE
     assert evaluation.witness[0]["classification"] == classification
@@ -125,19 +167,25 @@ def test_heartbeat_stale_is_unknown_without_a_heartbeat_and_false_after_terminal
         "stale_after_seconds": 10,
     }
     missing = evaluate_event_condition_tree(
-        condition, event_status(), now=100.0
+        condition, {"event-1": event_status()}, now=100.0
     )
     stale = evaluate_event_condition_tree(
         condition,
-        event_status(heartbeat={"sequence": 3, "host_received_at": 80.0, "payload": {}}),
+        {
+            "event-1": event_status(
+                heartbeat={"sequence": 3, "host_received_at": 80.0, "payload": {}}
+            )
+        },
         now=100.0,
     )
     terminal = evaluate_event_condition_tree(
         condition,
-        event_status(
-            heartbeat={"sequence": 3, "host_received_at": 80.0, "payload": {}},
-            terminal_event={"kind": "command_terminal", "status": "succeeded"},
-        ),
+        {
+            "event-1": event_status(
+                heartbeat={"sequence": 3, "host_received_at": 80.0, "payload": {}},
+                terminal_event={"kind": "command_terminal", "status": "succeeded"},
+            )
+        },
         now=100.0,
     )
 
@@ -154,8 +202,41 @@ def test_heartbeat_stale_is_unknown_without_a_heartbeat_and_false_after_terminal
 def test_missing_or_mismatched_bound_event_is_fatal_unknown() -> None:
     condition = {"type": "command_terminal", "reservation_id": "event-1"}
     assert evaluate_event_condition_tree(condition, None, now=100.0).fatal
-    wrong = event_status(kind="worker_terminal")
+    wrong = {"event-1": event_status(kind="worker_terminal")}
     assert evaluate_event_condition_tree(condition, wrong, now=100.0).fatal
+
+
+def test_composed_event_tree_selects_each_leaf_snapshot_by_reservation() -> None:
+    condition = {
+        "type": "all",
+        "children": [
+            {"type": "command_terminal", "reservation_id": "event-1"},
+            {"type": "worker_terminal", "reservation_id": "event-2"},
+        ],
+    }
+    statuses = {
+        "event-1": event_status(
+            terminal_event={"kind": "command_terminal", "status": "succeeded"}
+        ),
+        "event-2": event_status(
+            reservation_id="event-2",
+            kind="worker_terminal",
+            terminal_event={
+                "kind": "worker_terminal",
+                "outcome": "failed",
+                "producer_task_id": "worker-2",
+                "reason": "test",
+            },
+        ),
+    }
+
+    evaluation = evaluate_event_condition_tree(condition, statuses, now=100.0)
+
+    assert evaluation.value is TriState.TRUE
+    assert [item["reservation_id"] for item in evaluation.witness] == [
+        "event-1",
+        "event-2",
+    ]
 
 
 @pytest.mark.parametrize("fact", ["cancelled_at", "expired_at"])
@@ -170,7 +251,9 @@ def test_bound_cancelled_or_expired_event_fact_is_fatal_unknown(fact: str) -> No
     )
     status[fact] = 90.0
 
-    evaluation = evaluate_event_condition_tree(condition, status, now=100.0)
+    evaluation = evaluate_event_condition_tree(
+        condition, {"event-1": status}, now=100.0
+    )
 
     assert evaluation.value is TriState.UNKNOWN
     assert evaluation.fatal

@@ -6,7 +6,12 @@ import pytest
 
 from codex_wake_me_up.daemon import assert_event_schema_compatible
 from codex_wake_me_up.ledger import Ledger
-from codex_wake_me_up.models import ConflictError, MonitorState, TargetGuard
+from codex_wake_me_up.models import (
+    ConflictError,
+    MonitorState,
+    TargetGuard,
+    ValidationError,
+)
 from codex_wake_me_up.terminal_events import (
     normalize_command_terminal,
     normalize_heartbeat,
@@ -25,6 +30,30 @@ def command_terminal(*, status: str = "succeeded", exit_code: int = 0):
             "exit_code": exit_code,
         }
     )
+
+
+def reserve_commands(ledger: Ledger, *reservation_ids: str, expires_at: float = 200.0) -> None:
+    for reservation_id in reservation_ids:
+        ledger.reserve_event(
+            reservation_id=reservation_id,
+            idempotency_key=None,
+            kind="command_terminal",
+            producer_id=f"shell-{reservation_id}",
+            semantic={},
+            publish_token=f"secret-{reservation_id}",
+            expires_at=expires_at,
+            now=100.0,
+        )
+
+
+def composed_condition(*reservation_ids: str, operator: str = "all") -> dict:
+    return {
+        "type": operator,
+        "children": [
+            {"type": "command_terminal", "reservation_id": reservation_id}
+            for reservation_id in reservation_ids
+        ],
+    }
 
 
 def test_event_reservation_persists_only_a_redacted_publish_identity(tmp_path) -> None:
@@ -335,6 +364,75 @@ def test_terminal_publication_is_immutable_and_stops_heartbeats(tmp_path) -> Non
         )
 
 
+def test_settlement_uncertain_round_trips_through_durable_reservation(tmp_path) -> None:
+    ledger = Ledger(tmp_path)
+    ledger.reserve_event(
+        reservation_id="worker-event",
+        idempotency_key=None,
+        kind="worker_terminal",
+        producer_id="worker-1",
+        semantic={},
+        publish_token="secret-token",
+        expires_at=200.0,
+        now=100.0,
+    )
+
+    published = ledger.publish_terminal_event(
+        "worker-event",
+        publish_token="secret-token",
+        terminal_event={
+            "kind": "worker_terminal",
+            "outcome": "settlement_uncertain",
+            "producer_task_id": "worker-1",
+            "reason": "driver_unverifiable",
+        },
+        now=101.0,
+    )
+
+    assert published.terminal_event["task_success"] is False
+    assert published.terminal_event["lead_accepted"] is False
+    ledger.close()
+    reopened = Ledger(tmp_path)
+    assert reopened.get_event("worker-event").status_dict() == published.status_dict()
+
+
+def test_invalid_normalized_terminal_rolls_back_and_leaves_ledger_usable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-1", "event-2")
+    valid = command_terminal()
+
+    class InvalidTerminal:
+        fingerprint = valid.fingerprint
+
+        def as_dict(self) -> dict:
+            return {**valid.as_dict(), "task_success": True}
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "codex_wake_me_up.ledger.normalize_terminal_event",
+            lambda *_args, **_kwargs: InvalidTerminal(),
+        )
+        with pytest.raises(ValidationError, match="terminal success"):
+            ledger.publish_terminal_event(
+                "event-1",
+                publish_token="secret-event-1",
+                terminal_event=valid,
+                now=101.0,
+            )
+
+    assert ledger.get_event("event-1").state.value == "reserved"
+    assert ledger.get_event("event-1").terminal_event is None
+    published = ledger.publish_terminal_event(
+        "event-2",
+        publish_token="secret-event-2",
+        terminal_event=valid,
+        now=102.0,
+    )
+    assert published.state.value == "terminal"
+
+
 def test_monitor_creation_and_event_binding_are_one_transaction(tmp_path) -> None:
     first = Ledger(tmp_path)
     second = Ledger(tmp_path)
@@ -356,8 +454,7 @@ def test_monitor_creation_and_event_binding_are_one_transaction(tmp_path) -> Non
         condition={"type": "command_terminal", "reservation_id": "event-1"},
         allow_heuristic_continuation=False,
         expires_at=300.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=101.0,
     )
     assert created
@@ -372,11 +469,215 @@ def test_monitor_creation_and_event_binding_are_one_transaction(tmp_path) -> Non
             condition={"type": "command_terminal", "reservation_id": "event-1"},
             allow_heuristic_continuation=False,
             expires_at=300.0,
-            event_reservation_id="event-1",
-            event_kind="command_terminal",
+            event_bindings=(("event-1", "command_terminal"),),
             now=101.0,
         )
     assert second.get("monitor-2") is None
+
+
+def test_several_reservations_bind_to_one_monitor_and_remain_single_consumer(
+    tmp_path,
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-2", "event-1")
+    condition = composed_condition("event-2", "event-1", operator="any")
+
+    monitor, created = ledger.create_or_get(
+        monitor_id="monitor-1",
+        idempotency_key="monitor-request",
+        semantic={"request": "same"},
+        target=TargetGuard("test-thread", goal()),
+        condition=condition,
+        allow_heuristic_continuation=False,
+        expires_at=300.0,
+        event_bindings=(
+            ("event-1", "command_terminal"),
+            ("event-2", "command_terminal"),
+        ),
+        now=101.0,
+    )
+
+    assert created
+    assert [event.reservation_id for event in ledger.events_for_monitor(monitor.monitor_id)] == [
+        "event-1",
+        "event-2",
+    ]
+    with pytest.raises(ConflictError, match="already bound"):
+        ledger.create_or_get(
+            monitor_id="monitor-2",
+            idempotency_key=None,
+            semantic={"request": "other"},
+            target=TargetGuard("other-thread", goal()),
+            condition={"type": "command_terminal", "reservation_id": "event-2"},
+            allow_heuristic_continuation=False,
+            expires_at=300.0,
+            event_bindings=(("event-2", "command_terminal"),),
+            now=102.0,
+        )
+    assert ledger.get("monitor-2") is None
+
+
+def test_legacy_unique_monitor_binding_schema_migrates_without_value_changes(
+    tmp_path,
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "legacy-event")
+    before = ledger.get_event("legacy-event").status_dict()
+    ledger.close()
+    database = sqlite3.connect(tmp_path / "monitors.sqlite3")
+    database.executescript(
+        """
+        ALTER TABLE event_reservations RENAME TO event_reservations_new;
+        CREATE TABLE event_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            idempotency_key TEXT UNIQUE,
+            kind TEXT NOT NULL,
+            producer_id TEXT NOT NULL,
+            semantic_json TEXT NOT NULL,
+            state TEXT NOT NULL,
+            token_salt BLOB NOT NULL,
+            token_digest TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            bound_monitor_id TEXT UNIQUE,
+            heartbeat_json TEXT,
+            heartbeat_sequence INTEGER,
+            heartbeat_fingerprint TEXT,
+            terminal_json TEXT,
+            terminal_fingerprint TEXT,
+            attestation_json TEXT,
+            cancelled_at REAL,
+            expired_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO event_reservations SELECT * FROM event_reservations_new;
+        DROP TABLE event_reservations_new;
+        """
+    )
+    database.commit()
+    database.close()
+
+    migrated = Ledger(tmp_path)
+
+    assert migrated.get_event("legacy-event").status_dict() == before
+    indexes = migrated._connection.execute(
+        "PRAGMA index_list(event_reservations)"
+    ).fetchall()
+    bound_index = [
+        row
+        for row in indexes
+        if row["name"] == "event_reservations_bound_monitor"
+    ]
+    assert len(bound_index) == 1
+    assert bound_index[0]["unique"] == 0
+    assert not any(
+        row["unique"]
+        and [
+            column["name"]
+            for column in migrated._connection.execute(
+                f"PRAGMA index_info({row['name']})"
+            ).fetchall()
+        ]
+        == ["bound_monitor_id"]
+        for row in indexes
+    )
+
+
+@pytest.mark.parametrize("invalid_member", ["absent", "expired", "kind", "bound"])
+def test_multi_binding_failure_rolls_back_monitor_and_every_new_binding(
+    tmp_path, invalid_member: str
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-1")
+    if invalid_member != "absent":
+        ledger.reserve_event(
+            reservation_id="event-2",
+            idempotency_key=None,
+            kind=("worker_terminal" if invalid_member == "kind" else "command_terminal"),
+            producer_id="producer-2",
+            semantic={},
+            publish_token="secret-event-2",
+            expires_at=101.0 if invalid_member == "expired" else 200.0,
+            now=100.0,
+        )
+    if invalid_member == "bound":
+        ledger.create_or_get(
+            monitor_id="prior-monitor",
+            idempotency_key=None,
+            semantic={"request": "prior"},
+            target=TargetGuard("prior-thread", goal()),
+            condition={"type": "command_terminal", "reservation_id": "event-2"},
+            allow_heuristic_continuation=False,
+            expires_at=300.0,
+            event_bindings=(("event-2", "command_terminal"),),
+            now=100.5,
+        )
+
+    with pytest.raises(ConflictError):
+        ledger.create_or_get(
+            monitor_id="monitor-1",
+            idempotency_key=None,
+            semantic={"request": "multi"},
+            target=TargetGuard("test-thread", goal()),
+            condition=composed_condition("event-1", "event-2"),
+            allow_heuristic_continuation=False,
+            expires_at=300.0,
+            event_bindings=(
+                ("event-1", "command_terminal"),
+                ("event-2", "command_terminal"),
+            ),
+            now=101.0,
+        )
+
+    assert ledger.get("monitor-1") is None
+    assert ledger.get_event("event-1").bound_monitor_id is None
+
+
+def test_idempotent_multi_binding_replay_requires_the_exact_set(tmp_path) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-1", "event-2")
+    condition = composed_condition("event-1", "event-2")
+    bindings = (
+        ("event-1", "command_terminal"),
+        ("event-2", "command_terminal"),
+    )
+    original, _ = ledger.create_or_get(
+        monitor_id="monitor-1",
+        idempotency_key="same-request",
+        semantic={"request": "same"},
+        target=TargetGuard("test-thread", goal()),
+        condition=condition,
+        allow_heuristic_continuation=False,
+        expires_at=300.0,
+        event_bindings=bindings,
+        now=101.0,
+    )
+    replay, created = ledger.create_or_get(
+        monitor_id="discarded-monitor-id",
+        idempotency_key="same-request",
+        semantic={"request": "same"},
+        target=TargetGuard("test-thread", goal()),
+        condition=condition,
+        allow_heuristic_continuation=False,
+        expires_at=300.0,
+        event_bindings=bindings,
+        now=102.0,
+    )
+    assert not created
+    assert replay.monitor_id == original.monitor_id
+
+    with pytest.raises(ConflictError, match="exact event binding set"):
+        ledger.create_or_get(
+            monitor_id="discarded-monitor-id",
+            idempotency_key="same-request",
+            semantic={"request": "same"},
+            target=TargetGuard("test-thread", goal()),
+            condition={"type": "command_terminal", "reservation_id": "event-1"},
+            allow_heuristic_continuation=False,
+            expires_at=300.0,
+            event_bindings=(("event-1", "command_terminal"),),
+            now=103.0,
+        )
 
 
 def test_terminal_before_binding_survives_restart_and_binds_before_deadline(tmp_path) -> None:
@@ -408,8 +709,7 @@ def test_terminal_before_binding_survives_restart_and_binds_before_deadline(tmp_
         condition={"type": "command_terminal", "reservation_id": "event-1"},
         allow_heuristic_continuation=False,
         expires_at=300.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=102.0,
     )
     event = reopened.get_event("event-1")
@@ -441,8 +741,7 @@ def test_restart_preserves_every_event_lifecycle_fact(tmp_path, lifecycle: str) 
             condition={"type": "command_terminal", "reservation_id": "event-1"},
             allow_heuristic_continuation=False,
             expires_at=300.0,
-            event_reservation_id="event-1",
-            event_kind="command_terminal",
+            event_bindings=(("event-1", "command_terminal"),),
             now=101.0,
         )
     elif lifecycle == "terminal":
@@ -504,8 +803,7 @@ def test_cancel_or_expiry_winner_prevents_orphan_monitor_binding(tmp_path, winne
             condition={"type": "command_terminal", "reservation_id": "event-1"},
             allow_heuristic_continuation=False,
             expires_at=300.0,
-            event_reservation_id="event-1",
-            event_kind="command_terminal",
+            event_bindings=(("event-1", "command_terminal"),),
             now=bind_at,
         )
     assert second.get("orphan") is None
@@ -542,8 +840,7 @@ def test_event_snapshot_evaluation_and_claim_are_one_transaction(tmp_path) -> No
         condition=condition,
         allow_heuristic_continuation=False,
         expires_at=105.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=101.0,
     )
     ledger.arm(monitor.monitor_id)
@@ -582,6 +879,135 @@ def test_event_snapshot_evaluation_and_claim_are_one_transaction(tmp_path) -> No
     ) is None
 
 
+def test_multi_event_snapshot_claims_only_after_every_all_member_is_terminal(
+    tmp_path,
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-1", "event-2")
+    condition = composed_condition("event-1", "event-2")
+    monitor, _ = ledger.create_or_get(
+        monitor_id="monitor-1",
+        idempotency_key=None,
+        semantic={"request": "multi"},
+        target=TargetGuard("test-thread", goal()),
+        condition=condition,
+        allow_heuristic_continuation=False,
+        expires_at=200.0,
+        event_bindings=(
+            ("event-1", "command_terminal"),
+            ("event-2", "command_terminal"),
+        ),
+        now=101.0,
+    )
+    ledger.arm(monitor.monitor_id)
+    ledger.publish_terminal_event(
+        "event-2",
+        publish_token="secret-event-2",
+        terminal_event=command_terminal(),
+        now=102.0,
+    )
+    assert ledger.evaluate_and_claim_event_monitor(
+        monitor.monitor_id,
+        expected_evaluation_count=0,
+        observed_condition=condition,
+        external_evaluations={},
+        now_factory=lambda: 103.0,
+    ) is None
+    ledger.publish_terminal_event(
+        "event-1",
+        publish_token="secret-event-1",
+        terminal_event=command_terminal(),
+        now=104.0,
+    )
+
+    claimed = ledger.evaluate_and_claim_event_monitor(
+        monitor.monitor_id,
+        expected_evaluation_count=1,
+        observed_condition=condition,
+        external_evaluations={},
+        now_factory=lambda: 105.0,
+    )
+
+    assert claimed is not None
+    assert claimed.state.value == "claimed"
+    assert [item["reservation_id"] for item in claimed.witness] == [
+        "event-1",
+        "event-2",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_kind"),
+    [
+        ("missing", "missing_bound_reservation"),
+        ("extra", "extra_bound_reservation"),
+        ("mismatched", "reservation_kind_mismatch"),
+        ("malformed", "corrupt_bound_reservation"),
+    ],
+)
+def test_multi_snapshot_set_corruption_is_fatal_unknown(
+    tmp_path, corruption: str, expected_kind: str
+) -> None:
+    ledger = Ledger(tmp_path)
+    reserve_commands(ledger, "event-1", "event-2", "extra-event")
+    condition = composed_condition("event-1", "event-2")
+    monitor, _ = ledger.create_or_get(
+        monitor_id="monitor-1",
+        idempotency_key=None,
+        semantic={"request": "multi"},
+        target=TargetGuard("test-thread", goal()),
+        condition=condition,
+        allow_heuristic_continuation=False,
+        expires_at=200.0,
+        event_bindings=(
+            ("event-1", "command_terminal"),
+            ("event-2", "command_terminal"),
+        ),
+        now=101.0,
+    )
+    ledger.arm(monitor.monitor_id)
+    if corruption == "missing":
+        ledger._connection.execute(
+            "UPDATE event_reservations SET bound_monitor_id = NULL "
+            "WHERE reservation_id = 'event-2'"
+        )
+    elif corruption == "extra":
+        ledger._connection.execute(
+            "UPDATE event_reservations SET bound_monitor_id = 'monitor-1' "
+            "WHERE reservation_id = 'extra-event'"
+        )
+    elif corruption == "mismatched":
+        ledger._connection.execute(
+            "UPDATE event_reservations SET kind = 'worker_terminal' "
+            "WHERE reservation_id = 'event-2'"
+        )
+    else:
+        ledger._connection.execute(
+            "UPDATE event_reservations SET token_digest = 'broken' "
+            "WHERE reservation_id = 'event-2'"
+        )
+
+    failed = ledger.evaluate_and_claim_event_monitor(
+        monitor.monitor_id,
+        expected_evaluation_count=0,
+        observed_condition=condition,
+        external_evaluations={},
+        now_factory=lambda: 102.0,
+    )
+
+    assert failed is not None
+    assert failed.state.value == "observer_failed"
+    assert failed.evidence["kind"] == expected_kind
+    assert failed.evidence["expected_reservation_ids"] == ["event-1", "event-2"]
+    observed_ids = failed.evidence["observed_reservation_ids"]
+    if corruption == "missing":
+        assert observed_ids == ["event-1"]
+    elif corruption == "extra":
+        assert observed_ids == ["event-1", "event-2", "extra-event"]
+    else:
+        assert observed_ids == ["event-1", "event-2"]
+
+
 def test_missing_bound_event_becomes_observer_failed_not_an_untyped_retry(tmp_path) -> None:
     ledger = Ledger(tmp_path)
     ledger.reserve_event(
@@ -603,8 +1029,7 @@ def test_missing_bound_event_becomes_observer_failed_not_an_untyped_retry(tmp_pa
         condition=condition,
         allow_heuristic_continuation=False,
         expires_at=200.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=101.0,
     )
     ledger.arm(monitor.monitor_id)
@@ -645,8 +1070,7 @@ def test_downgrade_daemon_is_refused_while_a_bound_reservation_exists(tmp_path) 
         condition={"type": "command_terminal", "reservation_id": "event-1"},
         allow_heuristic_continuation=False,
         expires_at=200.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=101.0,
     )
     ledger.close()
@@ -687,8 +1111,7 @@ def test_downgrade_is_refused_for_nonterminal_event_monitor_with_missing_row(
         condition={"type": "command_terminal", "reservation_id": "event-1"},
         allow_heuristic_continuation=False,
         expires_at=200.0,
-        event_reservation_id="event-1",
-        event_kind="command_terminal",
+        event_bindings=(("event-1", "command_terminal"),),
         now=101.0,
     )
     ledger._connection.execute(

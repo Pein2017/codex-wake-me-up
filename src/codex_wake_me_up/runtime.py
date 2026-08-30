@@ -19,7 +19,7 @@ from .models import ValidationError
 
 
 RUNTIME_DIR_NAME = "codex-wake-me-up"
-EVENT_CAPABILITY_EPOCH = 1
+EVENT_CAPABILITY_EPOCH = 2
 DELIVERY_CAPABILITY_EPOCH = 1
 
 

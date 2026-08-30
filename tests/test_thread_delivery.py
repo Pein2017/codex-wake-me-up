@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import subprocess
 from typing import cast
 
 import pytest
@@ -31,6 +32,22 @@ from codex_wake_me_up.models import (
 from codex_wake_me_up.service import AppServerFactory, MonitorService
 
 from .helpers import Clock, FakeAppServer, observation
+
+
+def _git(repository, *arguments: str) -> str:
+    return subprocess.run(
+        ("git", "-C", str(repository), *arguments),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _git_commit(repository, name: str, content: str, message: str) -> str:
+    (repository / name).write_text(content, encoding="utf-8")
+    _git(repository, "add", name)
+    _git(repository, "commit", "-m", message)
+    return _git(repository, "rev-parse", "HEAD")
 
 
 class FakeThreadDelivery:
@@ -1436,3 +1453,94 @@ def test_uncertain_add_resumes_unloaded_thread_after_persisted_snapshot(tmp_path
     assert status["reconciliation"]["pre_resume_item_count"] == 1
     assert status["reconciliation"]["pre_resume_item_ids"] == ["older-item"]
     assert status["reconciliation"]["resume_attempted_at"] == 102.0
+
+
+def test_git_ref_change_wakes_the_thread_once_without_claiming_success(
+    tmp_path,
+) -> None:
+    repository = tmp_path / "repo"
+    _git(tmp_path, "init", str(repository))
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.invalid")
+    baseline = _git_commit(repository, "tracked.txt", "one\n", "baseline")
+    recorded = {
+        "classification": "recorded",
+        "runtime_status": "idle",
+        "interrupted": False,
+        "history_matches": 1,
+        "history_modified": 0,
+        "queue_matches": 0,
+        "queue_modified": 0,
+        "observed_pointer_count": 1,
+        "history": [{"turn_id": "turn-1", "message_id": "message-1"}],
+        "queue": [],
+        "queue_count": 0,
+    }
+    adapter = FakeThreadDelivery(inspections=[recorded])
+    service = _thread_service(tmp_path, adapter, Clock())
+    receipt = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={
+                "type": "git_ref_change",
+                "worktree": str(repository),
+                "ref": "HEAD",
+            },
+            expires_in_seconds=100,
+            idempotency_key="git-ref-thread",
+            start_daemon=False,
+        )
+    )
+    current = _git_commit(repository, "tracked.txt", "two\n", "successor")
+
+    asyncio.run(service.reconcile_once())
+    decision = service.decision_status(receipt["monitor_id"])
+
+    assert receipt["condition"]["direct_oid"] == baseline
+    assert decision["state"] == "recorded"
+    assert decision["wake_reason"] == "condition"
+    assert decision["witness"][0]["classification"] == "fast_forward"
+    assert decision["witness"][0]["old_direct_oid"] == baseline
+    assert decision["witness"][0]["new_direct_oid"] == current
+    assert decision["witness"][0]["task_success"] is False
+    assert decision["witness"][0]["lead_accepted"] is False
+    assert decision["delivery"]["classification"] == "recorded"
+    assert len(adapter.add_calls) == 1
+
+
+def test_git_ref_observer_failure_wakes_once_with_fixed_diagnostic(
+    tmp_path,
+) -> None:
+    repository = tmp_path / "repo"
+    _git(tmp_path, "init", str(repository))
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.invalid")
+    _git_commit(repository, "tracked.txt", "one\n", "baseline")
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, Clock())
+    receipt = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={
+                "type": "git_ref_change",
+                "worktree": str(repository),
+                "ref": "HEAD",
+            },
+            expires_in_seconds=100,
+            idempotency_key="git-ref-observer-failure",
+            start_daemon=False,
+        )
+    )
+    (repository / ".git").rename(repository / ".git-moved")
+
+    asyncio.run(service.reconcile_once())
+    decision = service.decision_status(receipt["monitor_id"])
+
+    assert decision["state"] == "queue_accepted"
+    assert decision["wake_reason"] == "observer_failed"
+    assert decision["failure_detail"] == {
+        "type": "git_ref_change",
+        "kind": "git_ref_observer_failed",
+        "error": "repository_identity_changed",
+    }
+    assert len(adapter.add_calls) == 1

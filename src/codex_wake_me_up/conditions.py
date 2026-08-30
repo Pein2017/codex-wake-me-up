@@ -8,11 +8,12 @@ import re
 import stat
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
+from .git_attestation import GitRefBinding, capture_git_ref, sample_git_ref
 from .models import Evaluation, TriState, ValidationError
 from .runtime import read_json
 
@@ -449,10 +450,21 @@ def prepare_condition(
     if condition_type == "thread_idle":
         _only_keys(raw, {"type", "thread_id", "accept_already_idle"}, "thread_idle")
         return _capture_thread_idle(raw, context)
+    if condition_type == "git_ref_change":
+        _only_keys(raw, {"type", "worktree", "ref"}, "git_ref_change")
+        worktree = raw.get("worktree")
+        ref = raw.get("ref")
+        if not isinstance(worktree, str) or not isinstance(ref, str):
+            raise ValidationError("Git ref binding cannot be proven")
+        try:
+            binding = capture_git_ref(worktree=worktree, ref=ref)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Git ref binding cannot be proven") from exc
+        return {"type": "git_ref_change", "binding": asdict(binding)}
     raise ValidationError(
         "unsupported condition type; use time, gpu_stable, pid_exit, tmux_exit, "
         "log_pattern, thread_idle, receipt_success, command_terminal, "
-        "worker_terminal, heartbeat_stale, all, or any"
+        "worker_terminal, heartbeat_stale, git_ref_change, all, or any"
     )
 
 
@@ -467,13 +479,13 @@ def _event_reservation_id(value: Any) -> str:
     return value
 
 
-def event_condition_binding(
+def event_condition_bindings(
     condition: Mapping[str, Any],
-) -> tuple[str, str] | None:
-    """Validate one-monitor/one-reservation event-leaf cardinality."""
+) -> tuple[tuple[str, str], ...]:
+    """Return the canonical terminal reservation set named by one AST."""
 
     reservations: set[str] = set()
-    terminal_leaves: list[tuple[str, str]] = []
+    terminal_leaves: dict[str, str] = {}
 
     def visit(node: Mapping[str, Any]) -> None:
         condition_type = node.get("type")
@@ -494,21 +506,21 @@ def event_condition_binding(
             reservation_id = _event_reservation_id(node.get("reservation_id"))
             reservations.add(reservation_id)
             if condition_type in {"command_terminal", "worker_terminal"}:
-                terminal_leaves.append((reservation_id, str(condition_type)))
+                if reservation_id in terminal_leaves:
+                    raise ValidationError(
+                        "event monitor contains a duplicate terminal leaf"
+                    )
+                terminal_leaves[reservation_id] = str(condition_type)
 
     visit(condition)
     if not reservations:
-        return None
-    if len(reservations) != 1:
-        raise ValidationError("one monitor may name only one distinct reservation")
-    if len(terminal_leaves) != 1:
-        if len(terminal_leaves) > 1:
-            raise ValidationError("event monitor contains a duplicate terminal leaf")
-        raise ValidationError("event monitor requires exactly one terminal leaf")
-    reservation_id, event_kind = terminal_leaves[0]
-    if reservation_id not in reservations:
-        raise ValidationError("terminal leaf reservation is inconsistent")
-    return reservation_id, event_kind
+        return ()
+    missing = reservations - terminal_leaves.keys()
+    if missing:
+        raise ValidationError(
+            "every event reservation requires exactly one matching terminal leaf"
+        )
+    return tuple(sorted(terminal_leaves.items()))
 
 
 def contains_event_condition(condition: Mapping[str, Any]) -> bool:
@@ -1078,6 +1090,68 @@ def _evaluate_receipt(condition: Mapping[str, Any]) -> Evaluation:
     )
 
 
+def _evaluate_git_ref(condition: Mapping[str, Any]) -> Evaluation:
+    try:
+        raw_binding = _expect_mapping(
+            condition.get("binding"), "stored Git ref binding"
+        )
+        binding = GitRefBinding(**dict(raw_binding))
+    except (TypeError, ValueError):
+        return Evaluation(
+            value=TriState.UNKNOWN,
+            evidence={
+                "type": "git_ref_change",
+                "kind": "git_ref_observer_failed",
+                "error": "invalid_binding",
+            },
+            fatal=True,
+        )
+    sample = sample_git_ref(binding)
+    if sample.classification == "observer_error":
+        return Evaluation(
+            value=TriState.UNKNOWN,
+            evidence={
+                "type": "git_ref_change",
+                "kind": "git_ref_observer_failed",
+                "error": sample.error,
+            },
+            fatal=True,
+        )
+    evidence: dict[str, Any] = {
+        "type": "git_ref_change",
+        "classification": sample.classification,
+        "worktree_root": binding.worktree_root,
+        "common_dir": binding.common_dir,
+        "ref": binding.ref,
+        "object_format": binding.object_format,
+        "coalesced": sample.coalesced,
+    }
+    for key in (
+        "old_direct_oid",
+        "new_direct_oid",
+        "old_peeled_commit",
+        "new_peeled_commit",
+        "old_head_target",
+        "new_head_target",
+        "ancestry",
+    ):
+        item = getattr(sample, key)
+        if item is not None:
+            evidence[key] = item
+    if not sample.changed:
+        return Evaluation(value=TriState.FALSE, evidence=evidence)
+    witness = {
+        **evidence,
+        "task_success": False,
+        "lead_accepted": False,
+    }
+    return Evaluation(
+        value=TriState.TRUE,
+        evidence=evidence,
+        witness=(witness,),
+    )
+
+
 def _combine(condition_type: str, children: list[Evaluation]) -> Evaluation:
     if condition_type == "all":
         if any(child.value == TriState.FALSE for child in children):
@@ -1119,13 +1193,13 @@ def _combine(condition_type: str, children: list[Evaluation]) -> Evaluation:
 
 def evaluate_event_condition_tree(
     condition: Mapping[str, Any],
-    event_status: Mapping[str, Any] | None,
+    event_statuses: Mapping[str, Mapping[str, Any]] | None,
     *,
     now: float,
     external_evaluations: Mapping[tuple[int, ...], Evaluation] | None = None,
     _path: tuple[int, ...] = (),
 ) -> Evaluation:
-    """Evaluate event leaves from one transaction-current reservation snapshot."""
+    """Evaluate event leaves from transaction-current reservation snapshots."""
 
     condition_type = condition.get("type")
     if condition_type in {"all", "any"}:
@@ -1139,7 +1213,7 @@ def evaluate_event_condition_tree(
             [
                 evaluate_event_condition_tree(
                     child,
-                    event_status,
+                    event_statuses,
                     now=now,
                     external_evaluations=external_evaluations,
                     _path=(*_path, index),
@@ -1155,9 +1229,14 @@ def evaluate_event_condition_tree(
         if external_evaluations is not None and _path in external_evaluations:
             return external_evaluations[_path]
         return _event_unknown(str(condition_type), "external_leaf_not_observed")
-    if event_status is None:
-        return _event_unknown(str(condition_type), "missing_bound_reservation")
     reservation_id = condition.get("reservation_id")
+    event_status = (
+        event_statuses.get(str(reservation_id))
+        if isinstance(event_statuses, Mapping)
+        else None
+    )
+    if not isinstance(event_status, Mapping):
+        return _event_unknown(str(condition_type), "missing_bound_reservation")
     if (
         event_status.get("reservation_id") != reservation_id
         or event_status.get("bound_monitor_id") in {None, ""}
@@ -1296,6 +1375,8 @@ def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverCon
         return _evaluate_thread_idle(condition, context)
     if condition_type == "receipt_success":
         return _evaluate_receipt(condition)
+    if condition_type == "git_ref_change":
+        return _evaluate_git_ref(condition)
     if condition_type in {"all", "any"}:
         raw_children = condition.get("children")
         # Children must be mutable: latch state persists only through in-place

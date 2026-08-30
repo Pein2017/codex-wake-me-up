@@ -207,6 +207,8 @@ class EventReservationRecord:
             host_received_at = terminal_input.pop("host_received_at", None)
             if terminal_input.pop("lead_accepted", False) is not False:
                 raise ValidationError("event reservation terminal acceptance is corrupt")
+            if terminal_input.pop("task_success", False) is not False:
+                raise ValidationError("event reservation terminal success is corrupt")
             try:
                 normalized_terminal = normalize_terminal_event(
                     terminal_input,
@@ -598,7 +600,7 @@ class Ledger:
                 token_salt BLOB NOT NULL,
                 token_digest TEXT NOT NULL,
                 expires_at REAL NOT NULL,
-                bound_monitor_id TEXT UNIQUE,
+                bound_monitor_id TEXT,
                 heartbeat_json TEXT,
                 heartbeat_sequence INTEGER,
                 heartbeat_fingerprint TEXT,
@@ -632,6 +634,103 @@ class Ledger:
                 connection.execute(
                     f"ALTER TABLE event_reservations ADD COLUMN {name} {declaration}"
                 )
+        indexes = connection.execute(
+            "PRAGMA index_list(event_reservations)"
+        ).fetchall()
+        unique_monitor_binding = any(
+            bool(index["unique"])
+            and [
+                column["name"]
+                for column in connection.execute(
+                    f"PRAGMA index_info({index['name']})"
+                ).fetchall()
+            ]
+            == ["bound_monitor_id"]
+            for index in indexes
+        )
+        if unique_monitor_binding:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                legacy_rows = connection.execute(
+                    "SELECT * FROM event_reservations"
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    EventReservationRecord.from_row(legacy_row)
+                duplicate = connection.execute(
+                    """
+                    SELECT bound_monitor_id
+                    FROM event_reservations
+                    WHERE bound_monitor_id IS NOT NULL
+                    GROUP BY bound_monitor_id
+                    HAVING COUNT(*) > 1
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if duplicate is not None:
+                    raise RuntimeError(
+                        "legacy event reservation bindings are not single-monitor"
+                    )
+                connection.execute(
+                    "ALTER TABLE event_reservations "
+                    "RENAME TO event_reservations_legacy"
+                )
+                connection.execute(
+                """
+                CREATE TABLE event_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT UNIQUE,
+                    kind TEXT NOT NULL,
+                    producer_id TEXT NOT NULL,
+                    semantic_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    token_salt BLOB NOT NULL,
+                    token_digest TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    bound_monitor_id TEXT,
+                    heartbeat_json TEXT,
+                    heartbeat_sequence INTEGER,
+                    heartbeat_fingerprint TEXT,
+                    terminal_json TEXT,
+                    terminal_fingerprint TEXT,
+                    attestation_json TEXT,
+                    cancelled_at REAL,
+                    expired_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+                )
+                connection.execute(
+                    """
+                INSERT INTO event_reservations(
+                    reservation_id, idempotency_key, kind, producer_id,
+                    semantic_json, state, token_salt, token_digest, expires_at,
+                    bound_monitor_id, heartbeat_json, heartbeat_sequence,
+                    heartbeat_fingerprint, terminal_json, terminal_fingerprint,
+                    attestation_json, cancelled_at, expired_at, created_at,
+                    updated_at
+                )
+                SELECT
+                    reservation_id, idempotency_key, kind, producer_id,
+                    semantic_json, state, token_salt, token_digest, expires_at,
+                    bound_monitor_id, heartbeat_json, heartbeat_sequence,
+                    heartbeat_fingerprint, terminal_json, terminal_fingerprint,
+                    attestation_json, cancelled_at, expired_at, created_at,
+                    updated_at
+                FROM event_reservations_legacy;
+                """
+                )
+                connection.execute("DROP TABLE event_reservations_legacy")
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS event_reservations_bound_monitor
+            ON event_reservations(bound_monitor_id)
+            """
+        )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -689,15 +788,16 @@ class Ledger:
             ).fetchone()
         return EventReservationRecord.from_row(row) if row is not None else None
 
-    def event_for_monitor(self, monitor_id: str) -> EventReservationRecord | None:
+    def events_for_monitor(self, monitor_id: str) -> list[EventReservationRecord]:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT * FROM event_reservations WHERE bound_monitor_id = ?",
                 (monitor_id,),
             ).fetchall()
-        if len(rows) > 1:
-            raise ConflictError("monitor is bound to multiple event reservations")
-        return EventReservationRecord.from_row(rows[0]) if rows else None
+        return sorted(
+            (EventReservationRecord.from_row(row) for row in rows),
+            key=lambda event: event.reservation_id,
+        )
 
     def event_capability_required(self) -> bool:
         from .conditions import contains_event_condition
@@ -1055,9 +1155,10 @@ class Ledger:
                 "SELECT * FROM event_reservations WHERE reservation_id = ?",
                 (reservation_id,),
             ).fetchone()
-            self._commit()
             assert updated is not None
-            return EventReservationRecord.from_row(updated)
+            persisted = EventReservationRecord.from_row(updated)
+            self._commit()
+            return persisted
         except BaseException:
             self._rollback()
             raise
@@ -1098,16 +1199,18 @@ class Ledger:
         idle_barrier: bool = False,
         initial_state: MonitorState = MonitorState.REGISTERING,
         rearm_of: str | None = None,
-        event_reservation_id: str | None = None,
-        event_kind: str | None = None,
+        event_bindings: tuple[tuple[str, str], ...] = (),
         now: float | None = None,
     ) -> tuple[MonitorRecord, bool]:
         """Create a monitor intent, or return its identical keyed ancestor."""
 
+        from .conditions import event_condition_bindings
+
         observed_at = time.time() if now is None else float(now)
-        if (event_reservation_id is None) != (event_kind is None):
+        expected_bindings = event_condition_bindings(condition)
+        if tuple(event_bindings) != expected_bindings:
             raise ConflictError(
-                "event reservation ID and event kind must be provided together"
+                "monitor condition and exact event binding set must match"
             )
         semantic_json = canonical_json(semantic)
         transaction = self._transaction()
@@ -1122,13 +1225,16 @@ class Ledger:
                         raise ConflictError(
                             "idempotency key already belongs to a monitor with different semantics"
                         )
-                    if event_reservation_id is not None:
-                        self._bind_event_in_transaction(
-                            transaction,
-                            reservation_id=event_reservation_id,
-                            event_kind=str(event_kind),
-                            monitor_id=existing.monitor_id,
-                            now=observed_at,
+                    if event_condition_bindings(existing.condition) != expected_bindings:
+                        raise ConflictError(
+                            "idempotent replay requires the exact event binding set"
+                        )
+                    actual_bindings = self._bound_event_bindings_in_transaction(
+                        transaction, existing.monitor_id
+                    )
+                    if actual_bindings != expected_bindings:
+                        raise ConflictError(
+                            "idempotent replay requires the exact event binding set"
                         )
                     self._commit()
                     return existing, False
@@ -1174,11 +1280,11 @@ class Ledger:
                     ),
                 ),
             )
-            if event_reservation_id is not None:
+            for reservation_id, event_kind in expected_bindings:
                 self._bind_event_in_transaction(
                     transaction,
-                    reservation_id=event_reservation_id,
-                    event_kind=str(event_kind),
+                    reservation_id=reservation_id,
+                    event_kind=event_kind,
                     monitor_id=monitor_id,
                     now=observed_at,
                 )
@@ -1339,6 +1445,22 @@ class Ledger:
             now=now,
         )
 
+    def _bound_event_bindings_in_transaction(
+        self,
+        transaction: sqlite3.Connection,
+        monitor_id: str,
+    ) -> tuple[tuple[str, str], ...]:
+        rows = transaction.execute(
+            "SELECT * FROM event_reservations WHERE bound_monitor_id = ?",
+            (monitor_id,),
+        ).fetchall()
+        return tuple(
+            sorted(
+                (event.reservation_id, event.kind)
+                for event in (EventReservationRecord.from_row(row) for row in rows)
+            )
+        )
+
     def _bind_event_in_transaction(
         self,
         transaction: sqlite3.Connection,
@@ -1370,7 +1492,7 @@ class Ledger:
             if event.terminal_event is not None
             else EventReservationState.BOUND
         )
-        transaction.execute(
+        cursor = transaction.execute(
             """
             UPDATE event_reservations
             SET bound_monitor_id = ?, state = ?, updated_at = ?
@@ -1378,6 +1500,8 @@ class Ledger:
             """,
             (monitor_id, state.value, now, reservation_id),
         )
+        if cursor.rowcount != 1:
+            raise ConflictError("event reservation binding lost its lifecycle race")
 
     def evaluate_and_claim_event_monitor(
         self,
@@ -1392,6 +1516,7 @@ class Ledger:
         """Persist event evaluation and its optional claim in one transaction."""
 
         from .conditions import (
+            event_condition_bindings,
             evaluate_event_condition_tree,
             witness_authorizes_continuation,
         )
@@ -1417,19 +1542,60 @@ class Ledger:
             ).fetchall()
             snapshot_error: str | None = None
             snapshot_kind = "corrupt_bound_reservation"
-            event_status: Mapping[str, Any] | None = None
-            if not event_rows:
-                snapshot_kind = "missing_bound_reservation"
-                snapshot_error = "bound event reservation is missing"
-            elif len(event_rows) != 1:
-                snapshot_error = "bound event reservation is missing or duplicated"
-            else:
+            event_statuses: dict[str, Mapping[str, Any]] = {}
+            expected_bindings: tuple[tuple[str, str], ...] = ()
+            actual_bindings = tuple(
+                sorted(
+                    (str(event_row["reservation_id"]), str(event_row["kind"]))
+                    for event_row in event_rows
+                    if isinstance(event_row["reservation_id"], str)
+                    and isinstance(event_row["kind"], str)
+                )
+            )
+            try:
+                expected_bindings = event_condition_bindings(current.condition)
+                observed_bindings = event_condition_bindings(observed_condition)
+            except ValidationError as exc:
+                expected_bindings = ()
+                observed_bindings = ()
+                snapshot_error = str(exc)
+                snapshot_kind = "invalid_event_condition_contract"
+            if snapshot_error is None and observed_bindings != expected_bindings:
+                snapshot_error = "observed event binding set differs from stored condition"
+                snapshot_kind = "reservation_identity_mismatch"
+            if snapshot_error is None:
                 try:
-                    event_status = EventReservationRecord.from_row(
-                        event_rows[0]
-                    ).status_dict()
+                    events = [
+                        EventReservationRecord.from_row(event_row)
+                        for event_row in event_rows
+                    ]
                 except Exception as exc:
                     snapshot_error = str(exc)
+                else:
+                    event_statuses = {
+                        event.reservation_id: event.status_dict() for event in events
+                    }
+                    if len(event_statuses) != len(events):
+                        snapshot_error = "bound event reservation identity is duplicated"
+                        snapshot_kind = "duplicate_bound_reservation"
+                    else:
+                        actual_bindings = tuple(
+                            sorted(
+                                (event.reservation_id, event.kind)
+                                for event in events
+                            )
+                        )
+                        expected_ids = {binding[0] for binding in expected_bindings}
+                        actual_ids = {binding[0] for binding in actual_bindings}
+                        if expected_ids - actual_ids:
+                            snapshot_error = "bound event reservation is missing"
+                            snapshot_kind = "missing_bound_reservation"
+                        elif actual_ids - expected_ids:
+                            snapshot_error = "unexpected bound event reservation"
+                            snapshot_kind = "extra_bound_reservation"
+                        elif actual_bindings != expected_bindings:
+                            snapshot_error = "bound event reservation kind differs"
+                            snapshot_kind = "reservation_kind_mismatch"
             observed_at = float(now_factory())
             condition = json.loads(canonical_json(observed_condition))
             if snapshot_error is not None:
@@ -1439,6 +1605,14 @@ class Ledger:
                         "type": "event_reservation",
                         "kind": snapshot_kind,
                         "error": snapshot_error,
+                        "expected_reservation_ids": [
+                            reservation_id
+                            for reservation_id, _event_kind in expected_bindings
+                        ],
+                        "observed_reservation_ids": [
+                            reservation_id
+                            for reservation_id, _event_kind in actual_bindings
+                        ],
                     },
                     fatal=True,
                 )
@@ -1455,7 +1629,7 @@ class Ledger:
             else:
                 evaluation = evaluate_event_condition_tree(
                     condition,
-                    event_status,
+                    event_statuses,
                     now=observed_at,
                     external_evaluations=external_evaluations,
                 )

@@ -75,3 +75,21 @@ def test_worker_adapter_rejects_a_command_descriptor(tmp_path) -> None:
                 "reason": "failed",
             },
         )
+
+
+def test_worker_adapter_rejects_unclassified_uncertain_settlement_before_publish(tmp_path) -> None:
+    publisher = Publisher()
+
+    with pytest.raises(ValidationError, match="fixed classification"):
+        publish_worker_terminal_from_descriptor(
+            publisher,
+            descriptor(tmp_path),
+            {
+                "kind": "worker_terminal",
+                "outcome": "settlement_uncertain",
+                "producer_task_id": "worker-1",
+                "reason": "freeform uncertainty",
+            },
+        )
+
+    assert publisher.calls == []

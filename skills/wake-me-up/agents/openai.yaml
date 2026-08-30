@@ -1,4 +1,4 @@
 interface:
   display_name: "Wake Me Up"
   short_description: "Arm guarded monitor instead of waiting"
-  default_prompt: "Use $wake-me-up to arm goal-independent wait_for_event for my current long same-host job."
+  default_prompt: "Use $wake-me-up: reserve before my launcher starts the producer, then arm its returned monitor_condition after launch."

@@ -7,6 +7,7 @@ from typing import Any, Mapping, Protocol
 
 from .models import ValidationError
 from .payloads import load_private_json_payload
+from .terminal_events import normalize_worker_terminal
 
 
 class TerminalPublisher(Protocol):
@@ -37,6 +38,7 @@ def publish_worker_terminal_from_descriptor(
         raise ValidationError("publisher descriptor has no publish capability")
     if terminal_event.get("kind") != "worker_terminal":
         raise ValidationError("worker adapter requires a worker_terminal envelope")
+    normalize_worker_terminal(terminal_event)
     return publisher.publish_terminal_event(
         reservation_id,
         publish_token=publish_token,

@@ -275,3 +275,75 @@ def test_failed_terminal_event_keeps_producer_evidence_and_false_flags(
     assert decision["terminal_event"]["producer_id"]
     assert decision["terminal_event"]["terminal_event"]["exit_code"] == 2
     assert "publish_token" not in json.dumps(decision)
+
+
+def test_plural_terminal_decision_is_bounded_and_cannot_fall_back_to_audit(
+    tmp_path,
+) -> None:
+    recorded = {
+        "classification": "recorded",
+        "runtime_status": "idle",
+        "interrupted": False,
+        "history_matches": 1,
+        "history_modified": 0,
+        "queue_matches": 0,
+        "queue_modified": 0,
+        "observed_pointer_count": 1,
+        "history": [{"turn_id": "turn-1", "message_id": "message-1"}],
+        "queue": [],
+        "queue_count": 0,
+    }
+    service = _thread_service(
+        tmp_path, FakeThreadDelivery(inspections=[recorded]), Clock()
+    )
+    reservations = [
+        service.reserve_terminal_event(
+            {
+                "kind": "command_terminal",
+                "expires_in_seconds": 100,
+                "idempotency_key": f"plural-command-{index}",
+                "producer_identity": f"shell-{index}",
+            }
+        )
+        for index in range(2)
+    ]
+    receipt = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={
+                "type": "all",
+                "children": [item["monitor_condition"] for item in reservations],
+            },
+            expires_in_seconds=100,
+            idempotency_key="plural-terminal-monitor",
+            start_daemon=False,
+        )
+    )
+    for index, reservation in enumerate(reservations):
+        service.publish_terminal_event(
+            reservation["reservation_id"],
+            publish_token=reservation["publish_token"],
+            terminal_event={
+                "kind": "command_terminal",
+                "status": "failed",
+                "command_label": f"SENSITIVE_USER_TEXT_{index}",
+                "command_digest": str(index) * 64,
+                "exit_code": index + 1,
+            },
+        )
+    asyncio.run(service.reconcile_once())
+
+    decision = service.decision_status(receipt["monitor_id"])
+    audit = service.status(receipt["monitor_id"])
+    budget = 2_500
+
+    assert _canonical_bytes(decision) <= budget
+    assert _canonical_bytes(audit) > budget
+    assert len(decision["terminal_events"]) == 2
+    assert "terminal_event" not in decision
+    assert "semantic" not in json.dumps(decision)
+    assert "token_fingerprint" not in json.dumps(decision)
+    assert "SENSITIVE_USER_TEXT" not in json.dumps(decision)
+    assert "SENSITIVE_USER_TEXT" in json.dumps(audit)
+    assert decision["task_success"] is False
+    assert decision["lead_accepted"] is False

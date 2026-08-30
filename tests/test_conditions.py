@@ -18,8 +18,109 @@ from codex_wake_me_up.models import TriState, ValidationError
 from .helpers import Clock
 
 
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ("git", "-C", str(repository), *arguments),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _git_commit(repository: Path, name: str, content: str, message: str) -> str:
+    (repository / name).write_text(content, encoding="utf-8")
+    _git(repository, "add", name)
+    _git(repository, "commit", "-m", message)
+    return _git(repository, "rev-parse", "HEAD")
+
+
 def context(tmp_path: Path, clock: Clock) -> ObserverContext:
     return ObserverContext(runtime_root=tmp_path, now=clock.now, gpu_query=lambda: {0: 0.0})
+
+
+def test_git_ref_change_captures_one_exact_ref_and_reports_fast_forward(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    _git(tmp_path, "init", str(repository))
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.invalid")
+    baseline = _git_commit(repository, "tracked.txt", "one\n", "private baseline")
+    prepared = prepare_condition(
+        {"type": "git_ref_change", "worktree": str(repository), "ref": "HEAD"},
+        context(tmp_path, Clock()),
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+
+    unchanged = evaluate_condition(prepared, context(tmp_path, Clock()))
+    current = _git_commit(repository, "tracked.txt", "two\n", "private successor")
+    changed = evaluate_condition(prepared, context(tmp_path, Clock()))
+
+    assert unchanged.value is TriState.FALSE
+    assert changed.value is TriState.TRUE
+    assert changed.witness == (
+        {
+            "type": "git_ref_change",
+            "classification": "fast_forward",
+            "worktree_root": str(repository.resolve()),
+            "common_dir": str((repository / ".git").resolve()),
+            "ref": "HEAD",
+            "object_format": "sha1",
+            "old_direct_oid": baseline,
+            "new_direct_oid": current,
+            "old_peeled_commit": baseline,
+            "new_peeled_commit": current,
+            "old_head_target": prepared["binding"]["head_target"],
+            "new_head_target": prepared["binding"]["head_target"],
+            "ancestry": "descendant",
+            "coalesced": True,
+            "task_success": False,
+            "lead_accepted": False,
+        },
+    )
+    assert "private" not in json.dumps(changed.evidence)
+
+
+def test_git_ref_change_registration_and_identity_failure_are_fail_closed(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    _git(tmp_path, "init", str(repository))
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.invalid")
+    _git_commit(repository, "tracked.txt", "one\n", "baseline")
+    observer = context(tmp_path, Clock())
+
+    with pytest.raises(ValidationError, match="Git ref binding"):
+        prepare_condition(
+            {
+                "type": "git_ref_change",
+                "worktree": str(repository),
+                "ref": "HEAD~1",
+            },
+            observer,
+            monitor_id="monitor",
+            receipt_token="token",
+        )
+
+    prepared = prepare_condition(
+        {"type": "git_ref_change", "worktree": str(repository), "ref": "HEAD"},
+        observer,
+        monitor_id="monitor",
+        receipt_token="token",
+    )
+    (repository / ".git").rename(repository / ".git-moved")
+
+    failed = evaluate_condition(prepared, observer)
+
+    assert failed.value is TriState.UNKNOWN
+    assert failed.fatal is True
+    assert failed.evidence == {
+        "type": "git_ref_change",
+        "kind": "git_ref_observer_failed",
+        "error": "repository_identity_changed",
+    }
 
 
 def test_any_receipt_or_time_requires_heuristic_opt_in_when_only_time_is_true(tmp_path: Path) -> None:

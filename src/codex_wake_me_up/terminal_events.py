@@ -79,6 +79,14 @@ class WorkerOutcome(StrEnum):
     BLOCKED = "blocked"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SETTLEMENT_UNCERTAIN = "settlement_uncertain"
+
+
+class SettlementUncertaintyReason(StrEnum):
+    """Fixed adapter classifications for an unverifiable worker settlement."""
+
+    DRIVER_REJECTED = "driver_rejected"
+    DRIVER_UNVERIFIABLE = "driver_unverifiable"
 
 
 def _validation(message: str) -> ValidationError:
@@ -470,6 +478,16 @@ class WorkerTerminalEvent:
                 raise _validation("non-delivery outcome must not claim a candidate commit")
             if self.reason is None:
                 raise _validation("non-delivery worker outcome requires a bounded reason")
+            if outcome is WorkerOutcome.SETTLEMENT_UNCERTAIN:
+                object.__setattr__(
+                    self,
+                    "reason",
+                    _enum(
+                        self.reason,
+                        SettlementUncertaintyReason,
+                        "settlement uncertainty fixed classification",
+                    ).value,
+                )
         _check_budget(self.semantic_payload())
 
     def semantic_payload(self) -> dict[str, Any]:
@@ -479,6 +497,8 @@ class WorkerTerminalEvent:
             "producer_task_id": self.producer_task_id,
             "lead_accepted": False,
         }
+        if self.outcome is WorkerOutcome.SETTLEMENT_UNCERTAIN:
+            payload["task_success"] = False
         if self.candidate_oid is not None:
             payload["candidate_oid"] = self.candidate_oid
         if self.reason is not None:
@@ -863,8 +883,20 @@ class Reservation:
         payload = dict(self.semantic_payload())
         if self.reservation_id is not None:
             payload["reservation_id"] = self.reservation_id
+            payload["monitor_condition"] = self.monitor_condition
         payload["state"] = cast(ReservationState, self.state).value
         return payload
+
+    @property
+    def monitor_condition(self) -> dict[str, str]:
+        """Return the non-secret terminal leaf for this identified reservation."""
+
+        if self.reservation_id is None:
+            raise _validation("monitor condition requires a reservation ID")
+        return {
+            "type": cast(EventKind, self.kind).value,
+            "reservation_id": self.reservation_id,
+        }
 
     def as_status(
         self,
@@ -1009,6 +1041,7 @@ __all__ = [
     "ReservationState",
     "CommandStatus",
     "WorkerOutcome",
+    "SettlementUncertaintyReason",
     "CommandTerminalEvent",
     "WorkerTerminalEvent",
     "TerminalEvent",

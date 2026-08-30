@@ -27,6 +27,23 @@ AttestationStatus = Literal[
     "out_of_scope",
     "attestation_error",
 ]
+GitRefClassification = Literal[
+    "unchanged",
+    "fast_forward",
+    "ref_rewrite",
+    "ref_deleted",
+    "head_retarget",
+    "observer_error",
+]
+GitRefAncestry = Literal["same", "descendant", "diverged", "deleted"]
+GitRefObserverError = Literal[
+    "invalid_binding",
+    "repository_identity_changed",
+    "git_failed",
+    "malformed_git_output",
+    "ref_unresolvable",
+    "observation_race",
+]
 
 
 @dataclass(frozen=True)
@@ -55,8 +72,158 @@ class GitAttestation:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class GitRefBinding:
+    """Immutable identity and exact direct-ref state captured at registration."""
+
+    worktree_root: str
+    common_dir: str
+    git_dir: str
+    object_format: str
+    ref: str
+    direct_oid: str
+    peeled_commit: str
+    head_target: str | None
+    worktree_device: int
+    worktree_inode: int
+    common_dir_device: int
+    common_dir_inode: int
+    git_dir_device: int
+    git_dir_inode: int
+
+
+@dataclass(frozen=True)
+class GitRefSample:
+    """Bounded one-shot comparison evidence for a captured Git ref."""
+
+    classification: GitRefClassification
+    changed: bool
+    old_direct_oid: str | None
+    new_direct_oid: str | None
+    old_peeled_commit: str | None
+    new_peeled_commit: str | None
+    old_head_target: str | None
+    new_head_target: str | None
+    ancestry: GitRefAncestry | None
+    coalesced: bool
+    error: GitRefObserverError | None = None
+
+
 class _GitFailure(RuntimeError):
     pass
+
+
+class _GitRefBindingFailure(RuntimeError):
+    pass
+
+
+class _GitRefIdentityFailure(RuntimeError):
+    pass
+
+
+class _GitRefMalformedFailure(RuntimeError):
+    pass
+
+
+class _GitRefResolutionFailure(RuntimeError):
+    pass
+
+
+class _GitRefRaceFailure(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _RawGitRef:
+    direct_oid: str
+    peeled_commit: str
+    head_target: str | None
+
+
+def capture_git_ref(*, worktree: str | Path, ref: str) -> GitRefBinding:
+    """Capture one exact local direct ref without changing repository state."""
+
+    try:
+        requested_root = Path(worktree)
+    except TypeError as error:
+        raise ValueError("worktree must be an absolute local path") from error
+    if not requested_root.is_absolute():
+        raise ValueError("worktree must be an absolute local path")
+    root = _canonical_existing_path(requested_root)
+    _validate_git_ref_shape(ref)
+
+    try:
+        discovered_root, common_dir, object_format = _discover_repository(root)
+        if discovered_root != root:
+            raise ValueError("worktree must be the repository worktree root")
+        oid_length = _oid_length(object_format)
+        git_dir = _discover_git_dir(root)
+        if ref != "HEAD":
+            _require_valid_direct_ref(root, ref)
+        root_identity = _path_identity(root)
+        common_identity = _path_identity(common_dir)
+        git_dir_identity = _path_identity(git_dir)
+        observed = _read_git_ref(root, ref, oid_length, allow_missing=False)
+        assert observed is not None
+        binding = GitRefBinding(
+            worktree_root=str(root),
+            common_dir=str(common_dir),
+            git_dir=str(git_dir),
+            object_format=object_format,
+            ref=ref,
+            direct_oid=observed.direct_oid,
+            peeled_commit=observed.peeled_commit,
+            head_target=observed.head_target,
+            worktree_device=root_identity[0],
+            worktree_inode=root_identity[1],
+            common_dir_device=common_identity[0],
+            common_dir_inode=common_identity[1],
+            git_dir_device=git_dir_identity[0],
+            git_dir_inode=git_dir_identity[1],
+        )
+        _verify_git_ref_binding(binding)
+        confirmed = _read_git_ref(root, ref, oid_length, allow_missing=False)
+        _verify_git_ref_binding(binding)
+        if confirmed != observed:
+            raise _GitRefRaceFailure("ref changed while it was captured")
+    except ValueError:
+        raise
+    except _GitRefResolutionFailure as error:
+        raise ValueError("ref must exist and peel to a commit") from error
+    except (
+        _GitFailure,
+        _GitRefBindingFailure,
+        _GitRefIdentityFailure,
+        _GitRefMalformedFailure,
+        _GitRefRaceFailure,
+    ) as error:
+        raise ValueError("Git ref binding cannot be proven") from error
+    return binding
+
+
+def sample_git_ref(binding: GitRefBinding) -> GitRefSample:
+    """Revalidate and compare one captured ref, returning only fixed/bounded data."""
+
+    try:
+        root, oid_length = _verify_git_ref_binding(binding)
+        first = _read_git_ref(root, binding.ref, oid_length, allow_missing=True)
+        _verify_git_ref_binding(binding)
+        second = _read_git_ref(root, binding.ref, oid_length, allow_missing=True)
+        _verify_git_ref_binding(binding)
+        if first != second:
+            raise _GitRefRaceFailure("ref changed while it was observed")
+        return _classify_git_ref(binding, root, first)
+    except (
+        ValueError,
+        OSError,
+        _GitFailure,
+        _GitRefBindingFailure,
+        _GitRefIdentityFailure,
+        _GitRefMalformedFailure,
+        _GitRefResolutionFailure,
+        _GitRefRaceFailure,
+    ) as error:
+        return _git_ref_error_sample(_git_ref_error_code(error))
 
 
 def capture_worktree_scope(
@@ -159,6 +326,276 @@ def _discover_repository(root: Path) -> tuple[Path, Path, str]:
     object_format = _output_text(_git(root, "rev-parse", "--show-object-format"))
     _oid_length(object_format)
     return discovered_root, common_dir, object_format
+
+
+def _discover_git_dir(root: Path) -> Path:
+    value = Path(os.fsdecode(_git(root, "rev-parse", "--git-dir").stdout.rstrip(b"\n")))
+    if not value.is_absolute():
+        value = root / value
+    try:
+        return value.resolve(strict=True)
+    except OSError as error:
+        raise _GitFailure("Git directory cannot be resolved") from error
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError as error:
+        raise _GitRefIdentityFailure("repository path cannot be identified") from error
+    return stat.st_dev, stat.st_ino
+
+
+def _validate_git_ref_shape(ref: object) -> None:
+    if ref == "HEAD":
+        return
+    if (
+        not isinstance(ref, str)
+        or not ref.startswith("refs/")
+        or ref.startswith("refs/remotes/")
+        or len(ref.encode("utf-8")) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in ref)
+    ):
+        raise ValueError("ref must be literal HEAD or one bounded local refs/... name")
+
+
+def _require_valid_direct_ref(root: Path, ref: str) -> None:
+    completed = _git(root, "check-ref-format", ref, check=False)
+    if completed.returncode != 0:
+        raise ValueError("ref must be a valid full direct refs/... name")
+    symbolic = _git(root, "symbolic-ref", "-q", ref, check=False)
+    if symbolic.returncode == 0:
+        raise ValueError("ref must name a direct ref, not a symbolic ref")
+    if symbolic.returncode != 1:
+        raise _GitFailure("Git symbolic-ref check failed")
+
+
+def _verify_git_ref_binding(binding: GitRefBinding) -> tuple[Path, int]:
+    if not isinstance(binding, GitRefBinding):
+        raise _GitRefBindingFailure("binding has the wrong type")
+    try:
+        _validate_git_ref_shape(binding.ref)
+        if binding.ref != "HEAD" and binding.head_target is not None:
+            raise ValueError("direct ref binding cannot contain a HEAD target")
+        if binding.ref == "HEAD" and binding.head_target is not None:
+            _validate_git_ref_shape(binding.head_target)
+        if not all(
+            isinstance(value, int) and value >= 0
+            for value in (
+                binding.worktree_device,
+                binding.worktree_inode,
+                binding.common_dir_device,
+                binding.common_dir_inode,
+                binding.git_dir_device,
+                binding.git_dir_inode,
+            )
+        ):
+            raise ValueError("binding contains an invalid path identity")
+        oid_length = _oid_length(binding.object_format)
+        if not _is_full_oid(binding.direct_oid, oid_length) or not _is_full_oid(
+            binding.peeled_commit, oid_length
+        ):
+            raise ValueError("binding contains an invalid object ID")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise _GitRefBindingFailure("stored Git ref binding is malformed") from error
+
+    try:
+        root = _canonical_existing_path(binding.worktree_root)
+        common = _canonical_existing_path(binding.common_dir)
+        git_dir = _canonical_existing_path(binding.git_dir)
+    except ValueError as error:
+        raise _GitRefIdentityFailure("captured repository paths are unavailable") from error
+    if (
+        str(root) != binding.worktree_root
+        or str(common) != binding.common_dir
+        or str(git_dir) != binding.git_dir
+    ):
+        raise _GitRefIdentityFailure("captured repository paths changed")
+    if _path_identity(root) != (binding.worktree_device, binding.worktree_inode) or _path_identity(
+        common
+    ) != (binding.common_dir_device, binding.common_dir_inode):
+        raise _GitRefIdentityFailure("captured repository path identity changed")
+    if _path_identity(git_dir) != (binding.git_dir_device, binding.git_dir_inode):
+        raise _GitRefIdentityFailure("captured Git directory identity changed")
+    try:
+        discovered_root, discovered_common, object_format = _discover_repository(root)
+        discovered_git_dir = _discover_git_dir(root)
+    except (ValueError, _GitFailure) as error:
+        raise _GitRefIdentityFailure("captured repository cannot be rediscovered") from error
+    if (
+        discovered_root != root
+        or discovered_common != common
+        or discovered_git_dir != git_dir
+        or object_format != binding.object_format
+    ):
+        raise _GitRefIdentityFailure("captured repository identity changed")
+    if _path_identity(root) != (binding.worktree_device, binding.worktree_inode) or _path_identity(
+        common
+    ) != (binding.common_dir_device, binding.common_dir_inode):
+        raise _GitRefIdentityFailure("repository identity changed while it was checked")
+    if _path_identity(git_dir) != (binding.git_dir_device, binding.git_dir_inode):
+        raise _GitRefIdentityFailure("Git directory identity changed while it was checked")
+    try:
+        if binding.ref != "HEAD":
+            _require_valid_direct_ref(root, binding.ref)
+        if binding.head_target is not None:
+            _require_valid_direct_ref(root, binding.head_target)
+    except ValueError as error:
+        raise _GitRefBindingFailure("stored Git ref name is malformed") from error
+    return root, oid_length
+
+
+def _read_git_ref(
+    root: Path, ref: str, oid_length: int, *, allow_missing: bool
+) -> _RawGitRef | None:
+    head_target: str | None = None
+    if ref == "HEAD":
+        symbolic = _git(root, "symbolic-ref", "-q", "HEAD", check=False)
+        if symbolic.returncode == 0:
+            head_target = _output_ref_name(symbolic)
+            try:
+                _validate_git_ref_shape(head_target)
+                _require_valid_direct_ref(root, head_target)
+            except ValueError as error:
+                raise _GitRefResolutionFailure("HEAD has an unusable symbolic target") from error
+        elif symbolic.returncode != 1:
+            raise _GitFailure("symbolic-ref failed")
+        direct_oid = _resolve_head_oid(root, oid_length)
+        if direct_oid is None:
+            raise _GitRefResolutionFailure("HEAD is unborn or unresolvable")
+    else:
+        exists = _git(root, "show-ref", "--verify", "--quiet", ref, check=False)
+        if exists.returncode == 1:
+            if allow_missing:
+                return None
+            raise _GitRefResolutionFailure("ref is absent")
+        if exists.returncode != 0:
+            raise _GitFailure("show-ref failed")
+        completed = _git(root, "show-ref", "--verify", "--hash", ref, check=False)
+        if completed.returncode != 0:
+            raise _GitFailure("show-ref failed")
+        direct_oid = _output_oid(completed, oid_length)
+    peeled_commit = _peel_commit(root, direct_oid, oid_length)
+    return _RawGitRef(
+        direct_oid=direct_oid,
+        peeled_commit=peeled_commit,
+        head_target=head_target,
+    )
+
+
+def _resolve_head_oid(root: Path, oid_length: int) -> str | None:
+    completed = _git(root, "rev-parse", "--verify", "HEAD", check=False)
+    if completed.returncode == 1 or completed.returncode == 128:
+        return None
+    if completed.returncode != 0:
+        raise _GitFailure("rev-parse failed")
+    return _output_oid(completed, oid_length)
+
+
+def _peel_commit(root: Path, direct_oid: str, oid_length: int) -> str:
+    completed = _git(root, "rev-parse", "--verify", f"{direct_oid}^{{commit}}", check=False)
+    if completed.returncode != 0:
+        raise _GitRefResolutionFailure("ref does not peel to a commit")
+    return _output_oid(completed, oid_length)
+
+
+def _output_oid(completed: subprocess.CompletedProcess[bytes], oid_length: int) -> str:
+    value = completed.stdout.rstrip(b"\n")
+    try:
+        decoded = value.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise _GitRefMalformedFailure("Git returned a non-ASCII object ID") from error
+    if not _is_full_oid(decoded, oid_length):
+        raise _GitRefMalformedFailure("Git returned a malformed object ID")
+    return decoded.lower()
+
+
+def _output_ref_name(completed: subprocess.CompletedProcess[bytes]) -> str:
+    value = completed.stdout.rstrip(b"\n")
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise _GitRefMalformedFailure("Git returned an undecodable ref name") from error
+    if not decoded or b"\n" in value or b"\r" in value or b"\0" in value:
+        raise _GitRefMalformedFailure("Git returned a malformed ref name")
+    return decoded
+
+
+def _classify_git_ref(
+    binding: GitRefBinding, root: Path, current: _RawGitRef | None
+) -> GitRefSample:
+    if current is None:
+        return _git_ref_sample(binding, None, "ref_deleted", "deleted")
+
+    if current.peeled_commit == binding.peeled_commit:
+        ancestry: GitRefAncestry = "same"
+    elif _is_ancestor(root, binding.peeled_commit, current.peeled_commit):
+        ancestry = "descendant"
+    else:
+        ancestry = "diverged"
+
+    if binding.ref == "HEAD" and current.head_target != binding.head_target:
+        classification: GitRefClassification = "head_retarget"
+    elif current.direct_oid == binding.direct_oid:
+        classification = "unchanged"
+    elif current.peeled_commit == binding.peeled_commit:
+        classification = "ref_rewrite"
+    elif ancestry == "descendant":
+        classification = "fast_forward"
+    else:
+        classification = "ref_rewrite"
+    return _git_ref_sample(binding, current, classification, ancestry)
+
+
+def _git_ref_sample(
+    binding: GitRefBinding,
+    current: _RawGitRef | None,
+    classification: GitRefClassification,
+    ancestry: GitRefAncestry,
+) -> GitRefSample:
+    changed = classification != "unchanged"
+    return GitRefSample(
+        classification=classification,
+        changed=changed,
+        old_direct_oid=binding.direct_oid,
+        new_direct_oid=current.direct_oid if current else None,
+        old_peeled_commit=binding.peeled_commit,
+        new_peeled_commit=current.peeled_commit if current else None,
+        old_head_target=binding.head_target,
+        new_head_target=current.head_target if current else None,
+        ancestry=ancestry,
+        coalesced=changed,
+    )
+
+
+def _git_ref_error_sample(error: GitRefObserverError) -> GitRefSample:
+    return GitRefSample(
+        classification="observer_error",
+        changed=False,
+        old_direct_oid=None,
+        new_direct_oid=None,
+        old_peeled_commit=None,
+        new_peeled_commit=None,
+        old_head_target=None,
+        new_head_target=None,
+        ancestry=None,
+        coalesced=False,
+        error=error,
+    )
+
+
+def _git_ref_error_code(error: BaseException) -> GitRefObserverError:
+    if isinstance(error, _GitRefBindingFailure):
+        return "invalid_binding"
+    if isinstance(error, _GitRefIdentityFailure):
+        return "repository_identity_changed"
+    if isinstance(error, _GitRefMalformedFailure):
+        return "malformed_git_output"
+    if isinstance(error, _GitRefResolutionFailure):
+        return "ref_unresolvable"
+    if isinstance(error, _GitRefRaceFailure):
+        return "observation_race"
+    return "git_failed"
 
 
 def _verify_captured_scope(scope: GitDeliveryScope) -> tuple[Path, int]:

@@ -14,6 +14,7 @@ from codex_wake_me_up.terminal_events import (
     Heartbeat,
     Reservation,
     ReservationState,
+    SettlementUncertaintyReason,
     WorkerOutcome,
     canonical_json,
     hash_publish_token,
@@ -77,6 +78,7 @@ def test_enums_are_typed_and_reject_unknown_values() -> None:
     assert ReservationState.BOUND.value == "bound"
     assert CommandStatus.SIGNALED.value == "signaled"
     assert WorkerOutcome.DELIVERED.value == "delivered"
+    assert WorkerOutcome.SETTLEMENT_UNCERTAIN.value == "settlement_uncertain"
 
     with pytest.raises(ValidationError, match="event kind"):
         normalize_terminal_event(command_payload(kind="not-an-event"))
@@ -149,6 +151,63 @@ def test_worker_non_delivery_requires_reason_and_forbids_a_candidate(outcome: st
     with pytest.raises(ValidationError, match="must not claim"):
         normalize_worker_terminal(
             worker_payload(outcome=outcome, reason="worker stopped", candidate_oid="b" * 40)
+        )
+
+
+def test_settlement_uncertain_is_terminal_immutable_and_explicitly_not_success() -> None:
+    event = normalize_worker_terminal(
+        worker_payload(
+            outcome="settlement_uncertain",
+            candidate_oid=None,
+            reason=SettlementUncertaintyReason.DRIVER_UNVERIFIABLE.value,
+        )
+    )
+
+    assert event.outcome is WorkerOutcome.SETTLEMENT_UNCERTAIN
+    assert event.candidate_oid is None
+    assert event.as_status() == {
+        "kind": "worker_terminal",
+        "outcome": "settlement_uncertain",
+        "producer_task_id": "worker-7",
+        "reason": "driver_unverifiable",
+        "producer_at": 100.5,
+        "task_success": False,
+        "lead_accepted": False,
+    }
+    assert validate_terminal_rewrite(event, event) is event
+    with pytest.raises(ConflictError, match="immutable"):
+        validate_terminal_rewrite(
+            event,
+            worker_payload(
+                outcome="settlement_uncertain",
+                candidate_oid=None,
+                reason=SettlementUncertaintyReason.DRIVER_REJECTED.value,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"candidate_oid": None, "reason": None}, "bounded reason"),
+        ({"candidate_oid": None, "reason": "freeform uncertainty"}, "fixed classification"),
+        ({"candidate_oid": "b" * 40, "reason": "driver_unverifiable"}, "must not claim"),
+        (
+            {
+                "candidate_oid": None,
+                "candidate_commit": "b" * 40,
+                "reason": "driver_unverifiable",
+            },
+            "exactly one field",
+        ),
+    ],
+)
+def test_settlement_uncertain_rejects_invalid_payloads(
+    overrides: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        normalize_worker_terminal(
+            worker_payload(outcome="settlement_uncertain", **overrides)
         )
 
 
@@ -235,6 +294,36 @@ def test_reservation_normalization_captures_worker_scope_and_state_is_typed() ->
     assert status["state"] == "reserved"
     assert "publish_token" not in status
     assert "token" not in status
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            reservation_payload(),
+            {"type": "worker_terminal", "reservation_id": "evt-123"},
+        ),
+        (
+            reservation_payload(
+                kind="command_terminal",
+                producer_task_id=None,
+                repository=None,
+                worktree=None,
+                baseline_commit=None,
+                allowed_path_prefixes=[],
+            ),
+            {"type": "command_terminal", "reservation_id": "evt-123"},
+        ),
+    ],
+)
+def test_reservation_status_exposes_only_its_monitor_condition(
+    payload: dict[str, object], expected: dict[str, str]
+) -> None:
+    reservation = normalize_reservation(payload, now=100.0)
+
+    assert reservation.monitor_condition == expected
+    assert reservation.as_status()["monitor_condition"] == expected
+    assert set(reservation.monitor_condition) == {"type", "reservation_id"}
 
 
 def test_worker_reservation_rejects_unsafe_or_unrestricted_scope() -> None:

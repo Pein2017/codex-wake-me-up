@@ -131,25 +131,29 @@ client transport and is not a delivery architecture.
 ## Terminal events and worker delivery
 
 For a command or delegated worker that can publish a bounded terminal event,
-the operator/agent workflow is:
+the safe non-blocking workflow is:
 
-1. Reserve one expiring, single-use event capability before starting the
-   producer.
-2. Hand the publish capability to the existing command wrapper or worker
-   harness. The plugin does not launch commands, execute raw shell predicates,
-   or replace the harness.
-3. Launch the command or worker through that existing harness.
-4. Bind the reservation while registering a monitor (or while performing the
-   existing watcher-first defer). A producer may publish before binding; the
-   reservation retains the event until it is bound or expires.
-5. End the lead's turn after a successful bind/defer. The lead is not billed a
-   continuation merely for reserving or binding; any resulting guarded wake is
-   a real continuation and may spend tokens or other model budget.
-6. The producer may send bounded heartbeats and then publish exactly one
-   terminal event through the handed capability. Publication is producer-owned;
-   it is not a command launched by the plugin.
-7. When the monitor wakes, the lead makes one status call and independently
-   reviews any worker candidate before deciding whether to integrate it.
+1. Reserve one expiring, single-use event capability before launch. The first
+   creation receipt contains a private publisher descriptor (when requested)
+   and a non-secret typed `monitor_condition`.
+2. Give only the private descriptor to the existing launcher. The launcher owns
+   the producer and may return the supplied `monitor_condition` in its spawn
+   receipt; this plugin neither launches it nor reads its private runtime.
+3. Launch the producer, then call `wait_for_event` with that returned condition.
+   This arms asynchronously and returns immediately; require its durable
+   `armed` receipt before ending the turn. A producer may publish before binding
+   if binding commits before the reservation deadline.
+4. For several producers, reserve and launch each independently, then compose
+   their returned leaves as typed `all` or `any` in one `wait_for_event` call.
+   `all` wakes only after every member settles; `any` consumes every bound
+   reservation permanently when the first member wins.
+5. After the bounded pointer arrives, call
+   `wake_me_up_status(monitor_id, view="decision")` exactly once and decide from
+   its evidence. A wake, terminal event, PID exit, ref movement, or candidate
+   commit is not task success or lead acceptance.
+
+“Do not synchronously wait” means skip the foreground join, not the later
+asynchronous arm. If no later wake is wanted, do not arm a monitor.
 
 The frozen producer surfaces are:
 
@@ -195,9 +199,10 @@ capability rather than passing it on the command line:
 }
 ```
 
-Native subagents and HarnessDock workers use the same `worker_terminal`
-envelope through `publish_worker_terminal_from_descriptor`; this is a narrow
-publisher adapter, not another watcher, callback scheduler, or wake claimant.
+An existing native or external worker launcher may use the same
+`worker_terminal` envelope through `publish_worker_terminal_from_descriptor`.
+That is a narrow publisher adapter, not another watcher, callback scheduler, or
+wake claimant; this README does not claim a launcher integration is installed.
 
 `command_terminal` and `worker_terminal` are distinct condition leaves and
 claims:
@@ -205,21 +210,22 @@ claims:
 - A `command_terminal` event reports one command outcome: `succeeded`,
   `failed`, `cancelled`, or `signaled`, with bounded execution evidence. Even
   exit code 0 proves only that bounded command process outcome.
-- A `worker_terminal` event reports `delivered`, `blocked`, `failed`, or
-  `cancelled`. `delivered` names one candidate commit and receives read-only
-  attestation against the reservation's repository, worktree, baseline, and
-  allowed paths. The candidate is a delivery for independent lead review, not
-  acceptance. In particular, `git commit` exit 0 is not delivery acceptance.
+- A `worker_terminal` event reports `delivered`, `blocked`, `failed`,
+  `cancelled`, or `settlement_uncertain`. `delivered` names one candidate commit
+  and receives read-only attestation against the reservation's repository,
+  worktree, baseline, and allowed paths. `settlement_uncertain` records why the
+  producer's result could not be established; neither outcome is acceptance.
 
 Every command terminal outcome wakes when bound, including succeeded, failed,
 cancelled, and signaled. Every worker terminal outcome also wakes when bound,
-including blocked, failed, cancelled, and a delivered event whose candidate is
-missing, baseline-
+including blocked, failed, cancelled, `settlement_uncertain`, and a delivered
+event whose candidate is missing, baseline-
 mismatched, out of scope, or otherwise has an invalid/error attestation. An
 invalid delivery must wake the lead so it can handle the evidence; it must not
 be silently converted to success or stranded until expiry. The plugin never
-reviews, stages, commits, merges, cherry-picks, reverts, pushes, or watches Git
-refs, worktrees, or unrelated commits.
+reviews, stages, commits, merges, cherry-picks, reverts, or pushes. Its optional
+`git_ref_change` condition only observes one captured local ref read-only; it
+does not watch unrelated commits or install Git hooks.
 
 Heartbeats are bounded liveness hints, not progress turns. `heartbeat_stale`
 is heuristic: it says that accepted heartbeats stopped advancing under the
@@ -275,18 +281,30 @@ All conditions are typed objects, combined with `all` or `any`.
 ```
 
 ```json
+{"type": "git_ref_change", "worktree": "/abs/repo", "ref": "refs/heads/main"}
+```
+
+```json
 {"type": "tmux_exit", "target_kind": "pane", "target": "%12", "socket": "/tmp/tmux-1000/default"}
 ```
 
 For tmux the monitor captures the original server PID and pane/session ID; a
-missing or restarted server is `unknown`, not completion. For PIDs it captures
-the boot ID, start time, and UID, so PID reuse or a reboot is also `unknown`.
-The same captured process in Linux state `Z`, `X`, or `x` is terminated even
-while its `/proc` record awaits reaping; registration rejects a PID that is
-already terminal. PID and tmux leaves remain liveness evidence, never task
-success. Pass the tmux socket explicitly: the environment fallback belongs to
-the registering service, and a dead pane that remains addressable is not a
-satisfied `tmux_exit` target-removal condition.
+missing or restarted server is `unknown`, not completion. tmux is only a shell
+around the real producer: use `pid_exit` for that exact producer PID whenever
+PID termination matters. For PIDs it captures the boot ID, start time, and UID,
+so PID reuse or a reboot is also `unknown`. The same captured process in Linux
+state `Z`, `X`, or `x` is terminated even while its `/proc` record awaits
+reaping; registration rejects a PID that is already terminal. PID and tmux
+leaves remain liveness evidence, never task success. Pass the tmux socket
+explicitly: the environment fallback belongs to the registering service, and a
+dead pane that remains addressable is not a satisfied `tmux_exit`
+target-removal condition.
+
+`git_ref_change` captures one absolute local worktree and literal `HEAD` or one
+full direct `refs/...` name at arming. It wakes once for bounded
+`fast_forward`, `ref_rewrite`, `ref_deleted`, or `head_retarget` evidence;
+repository identity or observation uncertainty is `unknown`. Ref movement is
+heuristic progress evidence, never producer, command, task, or lead success.
 
 ### `log_pattern`
 

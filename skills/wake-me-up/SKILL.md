@@ -12,19 +12,21 @@ host-local process with a stable witness.
 
 ## Ordinary lifecycle
 
-1. Launch or identify the durable producer and capture its exact log, receipt,
-   PID, tmux target, terminal-event reservation, or thread identity. A foreground
-   tool call does not become durable merely because the turn ends.
+1. An existing launcher owns the durable producer. Before launch, reserve a
+   terminal event when available; keep its private publisher descriptor with
+   that launcher and retain the returned non-secret `monitor_condition`. A
+   foreground tool call does not become durable merely because the turn ends.
 2. Choose the strongest condition the producer can bind:
    `command_terminal` or `worker_terminal`; monitor-bound `receipt_success`;
    the producer's success-and-failure log or receipt through `log_pattern`;
    `any(log_pattern, pid_exit(actual producer))`; then bare `pid_exit`.
    `tmux_exit`, GPU state, deadlines, and thread idle are weaker lifecycle or
    resource witnesses.
-3. Call goal-independent `wait_for_event` once with one typed condition, a
-   bounded expiry, and a stable `idempotency_key`. Do not provide a task ID;
-   trusted MCP metadata binds the current task and resolves a spawned child to
-   its root delivery target.
+3. Launch through that existing launcher, then call goal-independent
+   `wait_for_event` once with its returned typed condition, a bounded expiry,
+   and a stable `idempotency_key`. Do not provide a task ID; trusted MCP metadata
+   binds the current task and resolves a spawned child to its root delivery
+   target. This arms a later wake; it does not join the producer.
 
 ```json
 {
@@ -51,9 +53,10 @@ host-local process with a stable witness.
    monitor, compact condition binding, expiry, origin, root delivery target,
    delivery kind, supervision, and next action. If registration fails or is
    ambiguous, report it and remain active; do not assume a later wake.
-5. After `armed`, report the monitor ID and end the current turn. Do not sleep,
-   poll, or issue a long tool wait for the monitored interval; the daemon owns
-   observation.
+5. After `armed`, report the monitor ID and end the current turn. “Do not wait”
+   means do not synchronously join; it does not mean omit the asynchronous arm.
+   Do not sleep, poll, or issue a long tool wait for the monitored interval; the
+   daemon owns observation.
 6. A delivered pointer is bounded routing data, not a result or success claim.
    Call `wake_me_up_status(monitor_id, view="decision")` exactly once. That one
    response contains the witness or observer failure, wait statistics, selected
@@ -66,8 +69,8 @@ host-local process with a stable witness.
   bytes appended after arming are scanned. Rotation, truncation, or replacement
   is observer failure, never completion.
 - Point `pid_exit` at the actual producer, not a tmux wrapper when they differ.
-  PID and tmux exit prove liveness only; a zombie counts as terminated after its
-  captured identity still matches.
+  tmux is only a shell around that PID. PID and tmux exit prove liveness only; a
+  zombie counts as terminated after its captured identity still matches.
 - Pass an absolute tmux socket. `tmux_exit` observes removal of the captured
   pane/session target, not merely a dead pane process.
 - Only a successful monitor-bound `receipt_success` is authoritative task
@@ -75,6 +78,9 @@ host-local process with a stable witness.
   termination, or worker candidate is not whole-task or lead success.
 - Wake reason may be `condition`, `expired`, `unauthorized_evidence`, or
   `observer_failed`. The wake itself never upgrades the evidence.
+- `git_ref_change` is a one-shot, read-only local-ref observer. Its movement is
+  progress evidence, not success; its details are in the terminal-events
+  reference.
 
 ## Fixed boundaries
 
@@ -86,6 +92,8 @@ host-local process with a stable witness.
   messaging, a second app-server/Core writer, or automatic subagent follow-up.
 - Do not install or switch plugins, restart a daemon, launch paid continuation,
   or authorize material producer/model spend without separate permission.
+- Do not scrape a launcher's private runtime, scan processes to discover one,
+  add shell/tmux adapters, or automatically re-arm after a wake.
 - For a new occurrence after handling the wake, an agent may explicitly call a
   fresh `wait_for_event` with a new key and `rearm_of`; nothing re-arms itself.
 

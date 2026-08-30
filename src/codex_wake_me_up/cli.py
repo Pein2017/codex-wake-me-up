@@ -85,7 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument("--status", choices=("success", "failed"), required=True)
 
     event_reserve = subparsers.add_parser(
-        "event-reserve", help="reserve one terminal event from a private JSON payload"
+        "event-reserve",
+        help=(
+            "reserve one terminal event and return its separately armable condition"
+        ),
     )
     event_reserve.add_argument("--payload", type=Path, required=True)
     event_status = subparsers.add_parser(
