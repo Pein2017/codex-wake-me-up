@@ -143,10 +143,11 @@ the safe non-blocking workflow is:
    This arms asynchronously and returns immediately; require its durable
    `armed` receipt before ending the turn. A producer may publish before binding
    if binding commits before the reservation deadline.
-4. For several producers, reserve and launch each independently, then compose
-   their returned leaves as typed `all` or `any` in one `wait_for_event` call.
-   `all` wakes only after every member settles; `any` consumes every bound
-   reservation permanently when the first member wins.
+4. For all-settled control, compose the returned leaves as typed `all` in one
+   `wait_for_event` call. For continuing first-settlement control, arm one
+   independent single-leaf monitor per producer and explicitly cancel or retain
+   survivors after a wake. Typed `any` consumes every losing bound reservation;
+   every monitor needs explicit expiry and none re-arms or follows up itself.
 5. After the bounded pointer arrives, call
    `wake_me_up_status(monitor_id, view="decision")` exactly once and decide from
    its evidence. A wake, terminal event, PID exit, ref movement, or candidate
@@ -199,10 +200,13 @@ capability rather than passing it on the command line:
 }
 ```
 
-An existing native or external worker launcher may use the same
-`worker_terminal` envelope through `publish_worker_terminal_from_descriptor`.
-That is a narrow publisher adapter, not another watcher, callback scheduler, or
-wake claimant; this README does not claim a launcher integration is installed.
+An existing native or external worker launcher first runs
+`event-worker-preflight --descriptor <mode-0600 descriptor> --producer-task-id <id>`
+and later runs `event-worker-publish --descriptor <descriptor> --event-payload
+<mode-0600 event file>`. The descriptor is bearer-only input, never an argument
+value or output field. This is a narrow publisher adapter, not another watcher,
+callback scheduler, or wake claimant; this README does not claim a launcher
+integration is installed.
 
 `command_terminal` and `worker_terminal` are distinct condition leaves and
 claims:
@@ -210,11 +214,13 @@ claims:
 - A `command_terminal` event reports one command outcome: `succeeded`,
   `failed`, `cancelled`, or `signaled`, with bounded execution evidence. Even
   exit code 0 proves only that bounded command process outcome.
-- A `worker_terminal` event reports `delivered`, `blocked`, `failed`,
-  `cancelled`, or `settlement_uncertain`. `delivered` names one candidate commit
-  and receives read-only attestation against the reservation's repository,
-  worktree, baseline, and allowed paths. `settlement_uncertain` records why the
-  producer's result could not be established; neither outcome is acceptance.
+- A `worker_terminal` event reports `delivered`, `completed`, `blocked`,
+  `failed`, `cancelled`, or `settlement_uncertain`. Delivery scope is complete
+  or absent: only scoped `delivered` names a candidate commit and receives
+  read-only attestation. `completed` has no candidate, attestation, task
+  success, or lead acceptance. If a cooperative native worker exits before its
+  final publish, the monitor wakes only at expiry; a host-observed ThreadId
+  integration is deferred until that counterexample justifies it.
 
 Every command terminal outcome wakes when bound, including succeeded, failed,
 cancelled, and signaled. Every worker terminal outcome also wakes when bound,

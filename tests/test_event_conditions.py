@@ -160,6 +160,37 @@ def test_worker_delivery_wakes_for_valid_and_invalid_attestation(
     assert evaluation.witness[0]["lead_accepted"] is False
 
 
+def test_worker_completed_wakes_with_lifecycle_evidence_only() -> None:
+    condition = {"type": "worker_terminal", "reservation_id": "event-1"}
+    status = event_status(
+        kind="worker_terminal",
+        terminal_event={
+            "kind": "worker_terminal",
+            "outcome": "completed",
+            "producer_task_id": "worker-1",
+            "task_success": False,
+            "lead_accepted": False,
+        },
+    )
+
+    evaluation = evaluate_event_condition_tree(
+        condition, {"event-1": status}, now=100.0
+    )
+
+    assert evaluation.value is TriState.TRUE
+    witness = evaluation.witness[0]
+    assert witness["classification"] not in {
+        "worker_terminal_failure",
+        "valid_delivery_candidate",
+        "invalid_delivery",
+    }
+    assert witness["task_success"] is False
+    assert witness["lead_accepted"] is False
+    assert witness["terminal_event"]["outcome"] == "completed"
+    assert "candidate_oid" not in witness["terminal_event"]
+    assert "git_attestation" not in witness
+
+
 def test_heartbeat_stale_is_unknown_without_a_heartbeat_and_false_after_terminal() -> None:
     condition = {
         "type": "heartbeat_stale",

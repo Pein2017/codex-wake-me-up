@@ -93,3 +93,27 @@ def test_worker_adapter_rejects_unclassified_uncertain_settlement_before_publish
         )
 
     assert publisher.calls == []
+
+
+def test_worker_adapter_publishes_a_completed_settlement_without_a_candidate(
+    tmp_path,
+) -> None:
+    publisher = Publisher()
+    envelope = {
+        "kind": "worker_terminal",
+        "outcome": "completed",
+        "producer_task_id": "worker-1",
+    }
+
+    result = publish_worker_terminal_from_descriptor(
+        publisher, descriptor(tmp_path), envelope
+    )
+
+    assert result == {"published": True}
+    assert publisher.calls == [
+        {
+            "reservation_id": "event-1",
+            "publish_token": "secret-token",
+            "terminal_event": envelope,
+        }
+    ]

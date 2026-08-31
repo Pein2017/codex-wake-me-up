@@ -78,6 +78,7 @@ def test_enums_are_typed_and_reject_unknown_values() -> None:
     assert ReservationState.BOUND.value == "bound"
     assert CommandStatus.SIGNALED.value == "signaled"
     assert WorkerOutcome.DELIVERED.value == "delivered"
+    assert WorkerOutcome.COMPLETED.value == "completed"
     assert WorkerOutcome.SETTLEMENT_UNCERTAIN.value == "settlement_uncertain"
 
     with pytest.raises(ValidationError, match="event kind"):
@@ -134,6 +135,30 @@ def test_worker_delivery_requires_exactly_one_full_hex_oid() -> None:
     with pytest.raises(ValidationError, match="exactly one"):
         normalize_worker_terminal(
             worker_payload(candidate_oid="b" * 40, candidate_commit="b" * 40)
+        )
+
+
+def test_worker_completed_is_non_successful_settlement_without_a_candidate() -> None:
+    event = normalize_worker_terminal(
+        worker_payload(outcome="completed", candidate_oid=None)
+    )
+
+    assert event.outcome is WorkerOutcome.COMPLETED
+    assert event.candidate_oid is None
+    assert event.as_status() == {
+        "kind": "worker_terminal",
+        "outcome": "completed",
+        "producer_task_id": "worker-7",
+        "producer_at": 100.5,
+        "task_success": False,
+        "lead_accepted": False,
+    }
+
+
+def test_worker_completed_rejects_a_candidate_commit() -> None:
+    with pytest.raises(ValidationError, match="must not claim"):
+        normalize_worker_terminal(
+            worker_payload(outcome="completed", candidate_oid="b" * 40)
         )
 
 
@@ -294,6 +319,52 @@ def test_reservation_normalization_captures_worker_scope_and_state_is_typed() ->
     assert status["state"] == "reserved"
     assert "publish_token" not in status
     assert "token" not in status
+
+
+def test_worker_reservation_can_omit_delivery_scope_for_settlement_only() -> None:
+    reservation = normalize_reservation(
+        reservation_payload(
+            repository=None,
+            worktree=None,
+            baseline_commit=None,
+            allowed_path_prefixes=[],
+        ),
+        now=100.0,
+    )
+
+    assert reservation.producer_task_id == "worker-7"
+    assert reservation.repository is None
+    assert reservation.worktree is None
+    assert reservation.baseline_commit is None
+    assert reservation.allowed_path_prefixes == ()
+    assert not {
+        "repository",
+        "worktree",
+        "baseline_commit",
+        "allowed_path_prefixes",
+    } & reservation.semantic_payload().keys()
+
+
+@pytest.mark.parametrize(
+    "scope_field",
+    ["repository", "worktree", "baseline_commit", "allowed_path_prefixes"],
+)
+def test_worker_reservation_rejects_partial_delivery_scope(scope_field: str) -> None:
+    payload = reservation_payload(
+        repository=None,
+        worktree=None,
+        baseline_commit=None,
+        allowed_path_prefixes=[],
+    )
+    payload[scope_field] = {
+        "repository": "/srv/project/.git",
+        "worktree": "/srv/project",
+        "baseline_commit": "c" * 40,
+        "allowed_path_prefixes": ["src"],
+    }[scope_field]
+
+    with pytest.raises(ValidationError, match="complete.*absent"):
+        normalize_reservation(payload, now=100.0)
 
 
 @pytest.mark.parametrize(

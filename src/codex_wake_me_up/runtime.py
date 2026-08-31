@@ -19,7 +19,7 @@ from .models import ValidationError
 
 
 RUNTIME_DIR_NAME = "codex-wake-me-up"
-EVENT_CAPABILITY_EPOCH = 2
+EVENT_CAPABILITY_EPOCH = 3
 DELIVERY_CAPABILITY_EPOCH = 1
 
 
@@ -37,6 +37,7 @@ def _compute_loaded_source_identity() -> str:
         "runtime.py",
         "service.py",
         "terminal_events.py",
+        "worker_delivery_adapter.py",
     ):
         path = package_root / name
         digest.update(name.encode("utf-8"))

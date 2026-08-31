@@ -20,13 +20,7 @@ class TerminalPublisher(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def publish_worker_terminal_from_descriptor(
-    publisher: TerminalPublisher,
-    descriptor_path: str | Path,
-    terminal_event: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Publish one worker envelope without adding a watcher or scheduler."""
-
+def load_worker_publisher_descriptor(descriptor_path: str | Path) -> dict[str, str]:
     descriptor = load_private_json_payload(descriptor_path)
     if descriptor.get("schema") != 1 or descriptor.get("kind") != "worker_terminal":
         raise ValidationError("publisher descriptor must name worker_terminal schema 1")
@@ -36,11 +30,22 @@ def publish_worker_terminal_from_descriptor(
         raise ValidationError("publisher descriptor has no reservation ID")
     if not isinstance(publish_token, str) or not publish_token:
         raise ValidationError("publisher descriptor has no publish capability")
+    return {"reservation_id": reservation_id, "publish_token": publish_token}
+
+
+def publish_worker_terminal_from_descriptor(
+    publisher: TerminalPublisher,
+    descriptor_path: str | Path,
+    terminal_event: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish one worker envelope without adding a watcher or scheduler."""
+
+    descriptor = load_worker_publisher_descriptor(descriptor_path)
     if terminal_event.get("kind") != "worker_terminal":
         raise ValidationError("worker adapter requires a worker_terminal envelope")
     normalize_worker_terminal(terminal_event)
     return publisher.publish_terminal_event(
-        reservation_id,
-        publish_token=publish_token,
+        descriptor["reservation_id"],
+        publish_token=descriptor["publish_token"],
         terminal_event=terminal_event,
     )

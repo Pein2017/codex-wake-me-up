@@ -788,6 +788,18 @@ class Ledger:
             ).fetchone()
         return EventReservationRecord.from_row(row) if row is not None else None
 
+    def verify_event_publish_token(
+        self, reservation_id: str, publish_token: str
+    ) -> EventReservationRecord:
+        record = self.get_event(reservation_id)
+        if record is None:
+            raise ValidationError(f"unknown event reservation: {reservation_id}")
+        if not hmac.compare_digest(
+            _publish_token_digest(publish_token, record.token_salt), record.token_digest
+        ):
+            raise ValidationError("event publish capability is invalid")
+        return record
+
     def events_for_monitor(self, monitor_id: str) -> list[EventReservationRecord]:
         with self._lock:
             rows = self._connection.execute(

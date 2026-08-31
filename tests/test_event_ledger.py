@@ -396,6 +396,47 @@ def test_settlement_uncertain_round_trips_through_durable_reservation(tmp_path) 
     assert reopened.get_event("worker-event").status_dict() == published.status_dict()
 
 
+def test_worker_completed_settlement_is_immutable_and_has_no_delivery_attestation(
+    tmp_path,
+) -> None:
+    ledger = Ledger(tmp_path)
+    ledger.reserve_event(
+        reservation_id="worker-completed",
+        idempotency_key=None,
+        kind="worker_terminal",
+        producer_id="worker-completed",
+        semantic={"producer_task_id": "worker-completed"},
+        publish_token="secret-token",
+        expires_at=200.0,
+        now=100.0,
+    )
+    envelope = {
+        "kind": "worker_terminal",
+        "outcome": "completed",
+        "producer_task_id": "worker-completed",
+    }
+
+    published = ledger.publish_terminal_event(
+        "worker-completed",
+        publish_token="secret-token",
+        terminal_event=envelope,
+        now=101.0,
+    )
+    replay = ledger.publish_terminal_event(
+        "worker-completed",
+        publish_token="secret-token",
+        terminal_event=envelope,
+        now=102.0,
+    )
+
+    assert published.status_dict() == replay.status_dict()
+    assert published.terminal_event["outcome"] == "completed"
+    assert "candidate_oid" not in published.terminal_event
+    assert published.git_attestation is None
+    assert published.terminal_event["task_success"] is False
+    assert published.terminal_event["lead_accepted"] is False
+
+
 def test_invalid_normalized_terminal_rolls_back_and_leaves_ledger_usable(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -76,6 +76,7 @@ class CommandStatus(StrEnum):
 
 class WorkerOutcome(StrEnum):
     DELIVERED = "delivered"
+    COMPLETED = "completed"
     BLOCKED = "blocked"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -473,6 +474,11 @@ class WorkerTerminalEvent:
         if outcome is WorkerOutcome.DELIVERED:
             if self.candidate_oid is None:
                 raise _validation("delivered outcome requires exactly one full commit object ID")
+        elif outcome is WorkerOutcome.COMPLETED:
+            if self.candidate_oid is not None:
+                raise _validation("non-delivery outcome must not claim a candidate commit")
+            if self.reason is not None:
+                raise _validation("completed outcome must not carry a reason")
         else:
             if self.candidate_oid is not None:
                 raise _validation("non-delivery outcome must not claim a candidate commit")
@@ -497,7 +503,7 @@ class WorkerTerminalEvent:
             "producer_task_id": self.producer_task_id,
             "lead_accepted": False,
         }
-        if self.outcome is WorkerOutcome.SETTLEMENT_UNCERTAIN:
+        if self.outcome in {WorkerOutcome.COMPLETED, WorkerOutcome.SETTLEMENT_UNCERTAIN}:
             payload["task_success"] = False
         if self.candidate_oid is not None:
             payload["candidate_oid"] = self.candidate_oid
@@ -833,16 +839,25 @@ class Reservation:
         if self.kind is EventKind.WORKER_TERMINAL:
             if self.producer_task_id is None:
                 raise _validation("worker reservation requires producer task identity")
-            if self.repository is None or self.worktree is None or self.baseline_commit is None:
-                raise _validation("worker reservation requires repository delivery scope")
-            object.__setattr__(self, "repository", _absolute_path(self.repository, "repository"))
-            object.__setattr__(self, "worktree", _absolute_path(self.worktree, "worktree"))
-            object.__setattr__(self, "baseline_commit", _full_oid(self.baseline_commit, "baseline commit"))
-            object.__setattr__(
-                self,
-                "allowed_path_prefixes",
-                _relative_prefixes(self.allowed_path_prefixes),
+            scope_declared = (
+                self.repository is not None
+                or self.worktree is not None
+                or self.baseline_commit is not None
+                or bool(self.allowed_path_prefixes)
             )
+            if scope_declared:
+                if self.repository is None or self.worktree is None or self.baseline_commit is None:
+                    raise _validation("worker delivery scope must be complete or absent")
+                object.__setattr__(self, "repository", _absolute_path(self.repository, "repository"))
+                object.__setattr__(self, "worktree", _absolute_path(self.worktree, "worktree"))
+                object.__setattr__(self, "baseline_commit", _full_oid(self.baseline_commit, "baseline commit"))
+                object.__setattr__(
+                    self,
+                    "allowed_path_prefixes",
+                    _relative_prefixes(self.allowed_path_prefixes),
+                )
+            else:
+                object.__setattr__(self, "allowed_path_prefixes", ())
         else:
             if any(
                 item is not None and item != ()
@@ -864,7 +879,7 @@ class Reservation:
             value = getattr(self, name)
             if value is not None:
                 payload[name] = value
-        if self.kind is EventKind.WORKER_TERMINAL:
+        if self.kind is EventKind.WORKER_TERMINAL and self.repository is not None:
             payload.update(
                 {
                     "repository": self.repository,

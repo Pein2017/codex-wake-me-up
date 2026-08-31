@@ -315,6 +315,135 @@ def test_worker_delivery_attestation_is_stored_once_and_never_means_acceptance(
     assert replay == published
 
 
+def test_scopeless_worker_completed_wakes_with_non_success_lifecycle_evidence(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal worker end must not silently become Git delivery evidence."""
+
+    app_server = FakeAppServer(
+        [observation(), observation(), observation(runtime_status="idle")]
+    )
+    monitor_service = service(tmp_path, app_server, Clock())
+    monkeypatch.setattr(
+        "codex_wake_me_up.service.attest_candidate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed settlement reached Git attestation")
+        ),
+    )
+    reserved = monitor_service.reserve_terminal_event(
+        {
+            "kind": "worker_terminal",
+            "expires_in_seconds": 100,
+            "producer_task_id": "worker-completed",
+        }
+    )
+    registered = asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition=reserved["monitor_condition"],
+            expires_in_seconds=100,
+            start_daemon=False,
+        )
+    )
+
+    published = monitor_service.publish_terminal_event(
+        reserved["reservation_id"],
+        publish_token=reserved["publish_token"],
+        terminal_event={
+            "kind": "worker_terminal",
+            "outcome": "completed",
+            "producer_task_id": "worker-completed",
+        },
+    )
+    asyncio.run(monitor_service.reconcile_once())
+
+    assert published["state"] == "terminal"
+    assert published["terminal_event"]["outcome"] == "completed"
+    assert "candidate_oid" not in published["terminal_event"]
+    assert published["git_attestation"] is None
+    assert published["terminal_event"]["task_success"] is False
+    assert published["terminal_event"]["lead_accepted"] is False
+
+    decision = monitor_service.decision_status(registered["monitor_id"])
+    assert decision["task_success"] is False
+    assert decision["lead_accepted"] is False
+    assert decision["terminal_event"]["terminal_event"]["outcome"] == "completed"
+    assert "candidate_oid" not in decision["terminal_event"]["terminal_event"]
+    assert "git_attestation" not in decision["terminal_event"]
+    assert decision["witness"][0]["classification"] not in {
+        "worker_terminal_failure",
+        "valid_delivery_candidate",
+        "invalid_delivery",
+    }
+
+
+@pytest.mark.parametrize("outcome", ["delivered", "completed"])
+def test_scopeless_worker_rejects_delivery_or_completed_candidate(
+    tmp_path, outcome: str
+) -> None:
+    monitor_service = service(tmp_path, FakeAppServer([observation()]), Clock())
+    reserved = monitor_service.reserve_terminal_event(
+        {
+            "kind": "worker_terminal",
+            "expires_in_seconds": 100,
+            "producer_task_id": "worker-scopeless",
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        monitor_service.publish_terminal_event(
+            reserved["reservation_id"],
+            publish_token=reserved["publish_token"],
+            terminal_event={
+                "kind": "worker_terminal",
+                "outcome": outcome,
+                "producer_task_id": "worker-scopeless",
+                "candidate_oid": "b" * 40,
+            },
+        )
+
+    status = monitor_service.event_status(reserved["reservation_id"])
+    assert status["state"] == "reserved"
+    assert status["terminal_event"] is None
+    assert status["git_attestation"] is None
+
+
+def test_worker_idempotency_rejects_changing_from_scopeless_to_scoped(
+    tmp_path,
+) -> None:
+    repository = tmp_path / "repo"
+    git(tmp_path, "init", str(repository))
+    git(repository, "config", "user.name", "Test User")
+    git(repository, "config", "user.email", "test@example.invalid")
+    baseline = git_commit(repository, "src/base.txt", "base\n", "baseline")
+    monitor_service = service(tmp_path, FakeAppServer([observation()]), Clock())
+    first = monitor_service.reserve_terminal_event(
+        {
+            "kind": "worker_terminal",
+            "expires_in_seconds": 100,
+            "idempotency_key": "scope-change",
+            "producer_task_id": "worker-scope-change",
+        }
+    )
+
+    with pytest.raises(ConflictError):
+        monitor_service.reserve_terminal_event(
+            {
+                "kind": "worker_terminal",
+                "expires_in_seconds": 100,
+                "idempotency_key": "scope-change",
+                "producer_task_id": "worker-scope-change",
+                "repository": str(repository / ".git"),
+                "worktree": str(repository),
+                "baseline_commit": baseline,
+                "allowed_path_prefixes": ["src"],
+            }
+        )
+
+    status = monitor_service.event_status(first["reservation_id"])
+    assert status["state"] == "reserved"
+
+
 @pytest.mark.parametrize("outcome", ["delivered", "failed"])
 def test_worker_terminal_rejects_task_identity_mismatch_before_attestation(
     tmp_path, monkeypatch: pytest.MonkeyPatch, outcome: str

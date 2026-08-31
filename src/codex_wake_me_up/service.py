@@ -63,6 +63,7 @@ from .terminal_events import (
     normalize_reservation,
     normalize_terminal_event,
 )
+from .worker_delivery_adapter import load_worker_publisher_descriptor
 
 
 AppServerFactory = Callable[[], AsyncContextManager[AppServerClient]]
@@ -534,17 +535,18 @@ class MonitorService:
             raise ValidationError("terminal reservation requires a producer identity")
         semantic = normalized.semantic_payload()
         if normalized.kind is EventKind.WORKER_TERMINAL:
-            scope = capture_worktree_scope(
-                worktree=str(normalized.worktree),
-                baseline_commit=str(normalized.baseline_commit),
-                producer_task_id=str(normalized.producer_task_id),
-                allowed_prefixes=normalized.allowed_path_prefixes,
-            )
-            if Path(str(normalized.repository)).resolve() != Path(scope.common_dir):
-                raise ValidationError(
-                    "worker reservation repository does not match the Git common directory"
+            if normalized.worktree is not None:
+                scope = capture_worktree_scope(
+                    worktree=normalized.worktree,
+                    baseline_commit=str(normalized.baseline_commit),
+                    producer_task_id=str(normalized.producer_task_id),
+                    allowed_prefixes=normalized.allowed_path_prefixes,
                 )
-            semantic = {**semantic, "git_scope": asdict(scope)}
+                if Path(str(normalized.repository)).resolve() != Path(scope.common_dir):
+                    raise ValidationError(
+                        "worker reservation repository does not match the Git common directory"
+                    )
+                semantic = {**semantic, "git_scope": asdict(scope)}
         publish_token = secrets.token_urlsafe(32)
         record, created = self.ledger.reserve_event(
             reservation_id=reservation_id,
@@ -595,6 +597,28 @@ class MonitorService:
             },
         }
 
+    def preflight_worker_publisher_descriptor(
+        self, descriptor_path: str | Path, *, producer_task_id: str
+    ) -> dict[str, Any]:
+        descriptor = load_worker_publisher_descriptor(descriptor_path)
+        record = self.ledger.verify_event_publish_token(
+            descriptor["reservation_id"], descriptor["publish_token"]
+        )
+        frozen_task_id = record.semantic.get("producer_task_id")
+        if frozen_task_id != producer_task_id:
+            raise ValidationError("worker publisher producer task identity does not match reservation")
+        if record.kind != EventKind.WORKER_TERMINAL.value:
+            raise ValidationError("publisher descriptor reservation kind is invalid")
+        if record.state.value not in {"reserved", "bound"}:
+            raise ValidationError("worker publisher reservation is not live")
+        return {
+            "compatible": True,
+            "reservation_id": record.reservation_id,
+            "kind": record.kind,
+            "producer_task_id": producer_task_id,
+            "token_fingerprint": record.token_digest[:12],
+        }
+
     def cancel_terminal_event(self, reservation_id: str) -> dict[str, Any]:
         return self.ledger.cancel_event(reservation_id).status_dict()
 
@@ -635,7 +659,7 @@ class MonitorService:
                 frozen_worker_scope = raw_scope
                 frozen_task_id = raw_scope.get("producer_task_id")
             else:
-                frozen_task_id = None
+                frozen_task_id = record.semantic.get("producer_task_id")
             if (
                 not isinstance(frozen_task_id, str)
                 or normalized.producer_task_id != frozen_task_id
@@ -650,7 +674,8 @@ class MonitorService:
             and isinstance(normalized, WorkerTerminalEvent)
             and normalized.outcome is WorkerOutcome.DELIVERED
         ):
-            assert frozen_worker_scope is not None
+            if frozen_worker_scope is None:
+                raise ValidationError("delivered worker terminal requires complete frozen delivery scope")
             scope = GitDeliveryScope(
                 worktree_root=str(frozen_worker_scope["worktree_root"]),
                 common_dir=str(frozen_worker_scope["common_dir"]),

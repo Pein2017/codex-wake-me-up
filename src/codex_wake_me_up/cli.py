@@ -19,6 +19,7 @@ from .daemon import (
 from .payloads import load_private_json_payload
 from .runtime import codex_home_for_runtime_root, runtime_root
 from .service import MonitorService
+from .worker_delivery_adapter import publish_worker_terminal_from_descriptor
 
 
 def _root(value: Path | None) -> Path:
@@ -107,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         "event-publish", help="publish a terminal event from a private JSON payload"
     )
     event_publish.add_argument("--payload", type=Path, required=True)
+    event_worker_preflight = subparsers.add_parser(
+        "event-worker-preflight", help="validate a private worker publisher descriptor"
+    )
+    event_worker_preflight.add_argument("--descriptor", type=Path, required=True)
+    event_worker_preflight.add_argument("--producer-task-id", required=True)
+    event_worker_publish = subparsers.add_parser(
+        "event-worker-publish", help="publish a worker terminal event from private files"
+    )
+    event_worker_publish.add_argument("--descriptor", type=Path, required=True)
+    event_worker_publish.add_argument("--event-payload", type=Path, required=True)
     compatibility = subparsers.add_parser(
         "event-compatibility-check",
         help="preflight a target daemon epoch before replacing current source",
@@ -204,6 +215,22 @@ def main(argv: list[str] | None = None) -> int:
                     str(payload["reservation_id"]),
                     publish_token=str(payload["publish_token"]),
                     terminal_event=payload["terminal_event"],
+                )
+            )
+            return 0
+        if arguments.command == "event-worker-preflight":
+            _print(
+                MonitorService(root).preflight_worker_publisher_descriptor(
+                    arguments.descriptor, producer_task_id=arguments.producer_task_id
+                )
+            )
+            return 0
+        if arguments.command == "event-worker-publish":
+            _print(
+                publish_worker_terminal_from_descriptor(
+                    MonitorService(root),
+                    arguments.descriptor,
+                    load_private_json_payload(arguments.event_payload),
                 )
             )
             return 0

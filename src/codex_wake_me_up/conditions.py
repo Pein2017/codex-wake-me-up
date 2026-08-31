@@ -1315,7 +1315,9 @@ def evaluate_event_condition_tree(
 
     classification = "command_termination"
     if condition_type == "worker_terminal":
-        if terminal.get("outcome") != "delivered":
+        if terminal.get("outcome") == "completed":
+            classification = "worker_completed"
+        elif terminal.get("outcome") != "delivered":
             classification = "worker_terminal_failure"
         elif isinstance(event_status.get("git_attestation"), Mapping) and event_status[
             "git_attestation"
@@ -1332,8 +1334,9 @@ def evaluate_event_condition_tree(
         "lead_accepted": False,
         "terminal_event": copy.deepcopy(dict(terminal)),
         "last_heartbeat": copy.deepcopy(heartbeat),
-        "git_attestation": copy.deepcopy(event_status.get("git_attestation")),
     }
+    if event_status.get("git_attestation") is not None:
+        witness["git_attestation"] = copy.deepcopy(event_status["git_attestation"])
     return Evaluation(
         value=TriState.TRUE,
         evidence=dict(witness),

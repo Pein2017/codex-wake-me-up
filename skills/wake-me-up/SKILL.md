@@ -63,6 +63,14 @@ host-local process with a stable witness.
    delivery facts, abnormal delivery diagnostics, and terminal-event evidence.
    Decide from it without calling an additional details endpoint.
 
+For a cooperative native L1 or HarnessDock worker, reserve a `worker_terminal`
+event first. A scoped worker may publish `delivered`; a settlement-only worker
+may publish `completed` with no candidate, attestation, success, or acceptance.
+The launcher preflights its private mode-0600 descriptor before work and later
+publishes a separate mode-0600 event file; never put its bearer in arguments or
+output. A worker that exits before this final publish is not observed as settled:
+the monitor waits for expiry. Host-observed ThreadId integration is deferred.
+
 ## Condition rules
 
 - Every `log_pattern` must include both success and failure signatures. Only
@@ -96,6 +104,9 @@ host-local process with a stable witness.
   add shell/tmux adapters, or automatically re-arm after a wake.
 - For a new occurrence after handling the wake, an agent may explicitly call a
   fresh `wait_for_event` with a new key and `rearm_of`; nothing re-arms itself.
+- Use one composed `all` monitor to wake after every worker settles. For
+  continuing first-settlement control, arm independent single-leaf monitors;
+  retain or cancel survivors explicitly. Typed `any` consumes losers.
 
 ## Read details only when needed
 
