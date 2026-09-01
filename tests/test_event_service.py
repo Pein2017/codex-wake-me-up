@@ -187,6 +187,34 @@ def test_event_register_rejects_legacy_daemon_before_arm(tmp_path) -> None:
     assert monitor_service.ledger.list(include_terminal=True) == []
 
 
+def test_event_register_records_daemon_unavailable_when_retirement_wins_second_gate(
+    tmp_path,
+) -> None:
+    readiness = iter((True, False))
+    monitor_service = service(
+        tmp_path,
+        FakeAppServer([observation(), observation()]),
+        Clock(),
+        event_ready=lambda _root: next(readiness),
+    )
+    reserved = monitor_service.reserve_terminal_event(command_reservation())
+
+    result = asyncio.run(
+        monitor_service.register(
+            thread_id="test-thread",
+            condition={
+                "type": "command_terminal",
+                "reservation_id": reserved["reservation_id"],
+            },
+            expires_in_seconds=100,
+            start_daemon=False,
+        )
+    )
+
+    assert result["state"] == "daemon_unavailable"
+    assert result["outcome"]["kind"] == "event_daemon_mismatch_before_arm"
+
+
 @pytest.mark.parametrize(
     ("terminal_status", "exit_code"), [("succeeded", 0), ("failed", 2)]
 )

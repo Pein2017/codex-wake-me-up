@@ -69,6 +69,29 @@ def test_legacy_heartbeat_is_healthy_but_not_event_capable(tmp_path) -> None:
     assert not daemon_event_capable(tmp_path)
 
 
+def test_retiring_heartbeat_is_rejected_but_active_and_legacy_remain_compatible(
+    tmp_path,
+) -> None:
+    """An explicit retirement marker, not a missing legacy field, blocks readiness."""
+
+    atomic_write_json(
+        heartbeat_path(tmp_path),
+        {"pid": os.getpid(), "at": time.time(), "accepting_work": False},
+    )
+    assert not daemon_is_healthy(tmp_path)
+    assert not daemon_event_capable(tmp_path)
+    assert not daemon_delivery_capable(tmp_path)
+
+    with DaemonLock(tmp_path):
+        write_heartbeat(tmp_path, accepting_work=True)
+        assert daemon_is_healthy(tmp_path)
+        assert daemon_event_capable(tmp_path)
+        assert daemon_delivery_capable(tmp_path)
+
+    atomic_write_json(heartbeat_path(tmp_path), {"pid": os.getpid(), "at": time.time()})
+    assert daemon_is_healthy(tmp_path)
+
+
 def test_daemon_heartbeat_advertises_exact_event_epoch_and_source(tmp_path) -> None:
     assert EVENT_CAPABILITY_EPOCH == 3
     with DaemonLock(tmp_path):

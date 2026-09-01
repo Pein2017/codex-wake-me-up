@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import os
 import sys
+import time
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +23,9 @@ from .runtime import (
     write_heartbeat,
 )
 from .service import MonitorService
+
+
+IDLE_GRACE_SECONDS = 60.0
 
 
 class DaemonLock(AbstractContextManager["DaemonLock"]):
@@ -126,7 +130,14 @@ async def assert_delivery_runtime_compatible(
             )
 
 
-async def run_daemon(root: Path, *, interval_seconds: float, once: bool = False) -> int:
+async def run_daemon(
+    root: Path,
+    *,
+    interval_seconds: float,
+    once: bool = False,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> int:
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
     assert_event_schema_compatible(
@@ -138,13 +149,25 @@ async def run_daemon(root: Path, *, interval_seconds: float, once: bool = False)
     service = MonitorService(root)
     with DaemonLock(root):
         service.recover_after_daemon_start()
+        idle_deadline: float | None = None
         while True:
             write_heartbeat(root)
             await service.reconcile_once()
             write_heartbeat(root)
             if once:
                 return 0
-            await asyncio.sleep(interval_seconds)
+            if service.ledger.list(include_terminal=False):
+                idle_deadline = None
+            elif idle_deadline is None:
+                idle_deadline = monotonic() + IDLE_GRACE_SECONDS
+            elif monotonic() >= idle_deadline:
+                write_heartbeat(root, accepting_work=False)
+                if service.ledger.list(include_terminal=False):
+                    write_heartbeat(root)
+                    idle_deadline = None
+                else:
+                    return 0
+            await sleep(interval_seconds)
 
 
 def build_parser() -> argparse.ArgumentParser:

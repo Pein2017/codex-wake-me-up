@@ -165,6 +165,7 @@ def _thread_service(
     clock: Clock,
     *,
     observer_adapter: FakeAppServer | None = None,
+    thread_ready=lambda _root: True,
 ) -> MonitorService:
     return MonitorService(
         tmp_path,
@@ -179,8 +180,33 @@ def _thread_service(
         daemon_starter=lambda _root: False,
         daemon_readiness=lambda _root: True,
         event_daemon_readiness=lambda _root: True,
-        thread_delivery_readiness=lambda _root: True,
+        thread_delivery_readiness=thread_ready,
     )
+
+
+def test_thread_delivery_records_daemon_unavailable_when_retirement_wins_second_gate(
+    tmp_path,
+) -> None:
+    readiness = iter((True, False))
+    service = _thread_service(
+        tmp_path,
+        FakeThreadDelivery(),
+        Clock(),
+        thread_ready=lambda _root: next(readiness),
+    )
+
+    result = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 10},
+            expires_in_seconds=100,
+            idempotency_key="retiring-delivery",
+            start_daemon=False,
+        )
+    )
+
+    assert result["state"] == MonitorState.DAEMON_UNAVAILABLE
+    assert result["outcome"]["kind"] == "delivery_daemon_mismatch_before_arm"
 
 
 def test_thread_pointer_is_stable_bounded_and_contains_no_wake_evidence() -> None:

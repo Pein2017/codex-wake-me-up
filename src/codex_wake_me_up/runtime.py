@@ -163,7 +163,7 @@ def heartbeat_path(root: Path) -> Path:
     return root / "daemon-heartbeat.json"
 
 
-def write_heartbeat(root: Path) -> None:
+def write_heartbeat(root: Path, *, accepting_work: bool = True) -> None:
     atomic_write_json(
         heartbeat_path(root),
         {
@@ -172,6 +172,7 @@ def write_heartbeat(root: Path) -> None:
             "event_capability_epoch": EVENT_CAPABILITY_EPOCH,
             "delivery_capability_epoch": DELIVERY_CAPABILITY_EPOCH,
             "loaded_source_identity": loaded_source_identity(),
+            "accepting_work": accepting_work,
         },
     )
 
@@ -179,6 +180,8 @@ def write_heartbeat(root: Path) -> None:
 def daemon_is_healthy(root: Path, *, max_age_seconds: float = 15.0) -> bool:
     value = read_json(heartbeat_path(root))
     if not value:
+        return False
+    if value.get("accepting_work") is False:
         return False
     try:
         pid = int(value["pid"])
@@ -318,16 +321,61 @@ class DeferProtocolLock(AbstractContextManager["DeferProtocolLock"]):
                 self.handle = None
 
 
-def ensure_daemon(root: Path) -> bool:
-    """Start an isolated daemon only when a healthy one is not already known.
+class DaemonStartLock(AbstractContextManager["DaemonStartLock"]):
+    """Serialize one bounded replacement attempt for a runtime root."""
 
-    The function intentionally returns after spawning. A subsequent status call
-    exposes an absent/stale heartbeat as `unsupervised` rather than pretending
-    that the daemon is durable supervision.
-    """
+    def __init__(self, root: Path):
+        self.path = root / "daemon-start.lock"
+        self.handle = None
 
-    if daemon_is_healthy(root):
+    def __enter__(self) -> "DaemonStartLock":
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError("another daemon start is already in progress") from exc
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if self.handle is not None:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+                self.handle = None
+
+
+def _daemon_lock_is_held(root: Path) -> bool:
+    """Report whether any generation still owns the reconciliation lock."""
+
+    path = root / "daemon.lock"
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
         return False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            return False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _spawn_daemon(root: Path) -> bool:
+    """Spawn one daemon process without claiming that it is ready."""
+
     environment = os.environ.copy()
     source_root = Path(__file__).resolve().parents[1]
     previous = environment.get("PYTHONPATH")
@@ -347,13 +395,20 @@ def ensure_daemon(root: Path) -> bool:
     return True
 
 
+def ensure_daemon(root: Path) -> bool:
+    """Establish an accepting daemon rather than racing a retiring owner."""
+
+    return ensure_daemon_ready(root, starter=_spawn_daemon)
+
+
 def ensure_daemon_ready(
     root: Path,
     *,
     timeout_seconds: float = 2.0,
     poll_interval_seconds: float = 0.05,
-    starter: Callable[[Path], bool] = ensure_daemon,
+    starter: Callable[[Path], bool] | None = None,
     health_check: Callable[[Path], bool] = daemon_is_healthy,
+    lock_held: Callable[[Path], bool] = _daemon_lock_is_held,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
@@ -361,20 +416,39 @@ def ensure_daemon_ready(
 
     if timeout_seconds <= 0 or poll_interval_seconds <= 0:
         raise ValueError("daemon readiness bounds must be positive")
-    if health_check(root):
-        return True
-    try:
-        starter(root)
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        return False
     deadline = monotonic() + timeout_seconds
+    spawn = starter or _spawn_daemon
     while monotonic() < deadline:
         if health_check(root):
             return True
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            break
-        sleep(min(poll_interval_seconds, remaining))
+        try:
+            with DaemonStartLock(root):
+                if health_check(root):
+                    return True
+                while lock_held(root):
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        return health_check(root)
+                    sleep(min(poll_interval_seconds, remaining))
+                    if health_check(root):
+                        return True
+                try:
+                    spawn(root)
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    return False
+                while monotonic() < deadline:
+                    if health_check(root):
+                        return True
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        break
+                    sleep(min(poll_interval_seconds, remaining))
+                return health_check(root)
+        except RuntimeError:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            sleep(min(poll_interval_seconds, remaining))
     return health_check(root)
 
 
