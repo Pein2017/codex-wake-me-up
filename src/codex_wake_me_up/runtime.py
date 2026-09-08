@@ -234,6 +234,41 @@ def daemon_delivery_capable(root: Path, *, max_age_seconds: float = 15.0) -> boo
     )
 
 
+def delivery_daemon_unready_reason(
+    root: Path, *, max_age_seconds: float = 15.0
+) -> str | None:
+    """Return the first current delivery-readiness mismatch without changing state."""
+
+    path = heartbeat_path(root)
+    value = read_json(path)
+    if value is None:
+        return "malformed_heartbeat" if path.exists() else "missing_heartbeat"
+    if not value:
+        return "malformed_heartbeat"
+    if value.get("accepting_work") is False:
+        return "retiring_owner"
+    try:
+        pid = int(value["pid"])
+        at = float(value["at"])
+    except (KeyError, TypeError, ValueError):
+        return "malformed_heartbeat"
+    if time.time() - at > max_age_seconds:
+        return "stale_heartbeat"
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return "dead_process"
+    if value.get("delivery_capability_epoch") != DELIVERY_CAPABILITY_EPOCH:
+        return "delivery_capability_epoch_mismatch"
+    if value.get("event_capability_epoch") != EVENT_CAPABILITY_EPOCH:
+        return "event_capability_epoch_mismatch"
+    if value.get("loaded_source_identity") != loaded_source_identity():
+        return "source_identity_mismatch"
+    if not _daemon_lock_is_held_by(root, pid):
+        return "lock_owner_mismatch"
+    return None
+
+
 def _daemon_lock_is_held_by(root: Path, advertised_pid: int) -> bool:
     """Prove the advertised PID also owns the runtime's reconciliation lock."""
 

@@ -21,6 +21,7 @@ from .conditions import (
     event_condition_bindings,
     evaluate_condition,
     journal_tail,
+    native_worker_observation_requests,
     observe_external_condition_leaves,
     prepare_condition,
     public_condition_semantics,
@@ -33,6 +34,7 @@ from .ledger import Ledger, MonitorRecord
 from .models import (
     AppServerError,
     AppServerRejectedError,
+    AppServerTransportError,
     ConflictError,
     MonitorMode,
     MonitorState,
@@ -47,6 +49,7 @@ from .runtime import (
     atomic_write_json,
     codex_home_for_runtime_root,
     daemon_is_healthy,
+    delivery_daemon_unready_reason,
     DeferProtocolLock,
     ensure_daemon,
     ensure_daemon_ready,
@@ -127,6 +130,15 @@ def _condition_binding_summary(condition: Mapping[str, Any]) -> dict[str, Any]:
             "thread_id",
             "accept_already_idle",
             "armed_runtime_status",
+        ):
+            summary[key] = condition.get(key)
+    elif condition_type == "native_worker_terminal":
+        for key in (
+            "task_name",
+            "root_thread_id",
+            "child_thread_id",
+            "invocation_id",
+            "armed_status",
         ):
             summary[key] = condition.get(key)
     elif condition_type == "git_ref_change":
@@ -267,7 +279,9 @@ class MonitorService:
         self.root = root or runtime_root()
         self.ledger = ledger or Ledger(self.root)
         self.app_server_factory = app_server_factory or (
-            lambda: AppServerClient(codex_home_for_runtime_root(self.root))
+            lambda: AppServerClient(
+                codex_home_for_runtime_root(self.root), experimental_api=True
+            )
         )
         self.thread_delivery_factory = thread_delivery_factory or (
             lambda: AppServerClient(
@@ -435,16 +449,24 @@ class MonitorService:
             self._validate_event_replay(existing, condition)
             return self._registration_response(existing)
         if not self.thread_delivery_readiness(self.root):
+            reason = delivery_daemon_unready_reason(self.root) or "readiness_changed"
             raise ValidationError(
-                "thread delivery requires an exact delivery-capable daemon before arming"
+                "thread delivery requires an exact delivery-capable daemon before arming: "
+                f"stage=delivery_daemon_readiness reason={reason}"
             )
         event_bindings = event_condition_bindings(condition)
         if event_bindings and not self.event_daemon_readiness(self.root):
             raise ValidationError(
                 "event monitor requires an exact event-capable daemon before arming"
             )
-        async with self.thread_delivery_factory() as app_server:
-            capability = await app_server.resolve_thread_delivery(thread_id)
+        try:
+            async with self.thread_delivery_factory() as app_server:
+                capability = await app_server.resolve_thread_delivery(thread_id)
+        except AppServerError as exc:
+            raise AppServerError(
+                "thread delivery registration failed: "
+                f"stage=resolve_delivery_target error={exc}"
+            ) from exc
         if capability.get("origin_thread_id") != thread_id:
             raise ValidationError("thread delivery resolved a different origin")
         delivery_thread_id = capability.get("delivery_thread_id")
@@ -470,11 +492,32 @@ class MonitorService:
         )
         semantic["delivery"] = delivery
         observer_context = self.observer_context_factory()
+        observer_context.native_worker_root_thread_id = delivery_thread_id
         children = self._reject_self_wait(condition, delivery_thread_id)
-        async with self.app_server_factory() as app_server:
-            observer_context.thread_observations.update(
-                await self._read_thread_observations(app_server, children)
+        native_workers = native_worker_observation_requests(
+            condition, root_thread_id=delivery_thread_id
+        )
+        if native_workers and not trusted_caller:
+            raise ValidationError(
+                "native_worker_terminal requires the trusted current root binding"
             )
+        try:
+            async with self.app_server_factory() as app_server:
+                observer_context.thread_observations.update(
+                    await self._read_thread_observations(
+                        app_server, children, fail_on_error=True
+                    )
+                )
+                observer_context.native_worker_observations.update(
+                    await self._read_native_worker_observations(
+                        app_server, native_workers
+                    )
+                )
+        except AppServerError as exc:
+            raise AppServerError(
+                "thread delivery registration failed: "
+                f"stage=prepare_condition error={exc}"
+            ) from exc
         receipt_token = secrets.token_urlsafe(32)
         prepared_condition = prepare_condition(
             condition,
@@ -501,7 +544,12 @@ class MonitorService:
                 record.monitor_id,
                 expected=(MonitorState.REGISTERING,),
                 state=MonitorState.DAEMON_UNAVAILABLE,
-                outcome={"kind": "delivery_daemon_mismatch_before_arm", "at": time.time()},
+                outcome={
+                    "kind": "delivery_daemon_mismatch_before_arm",
+                    "reason": delivery_daemon_unready_reason(self.root)
+                    or "readiness_changed",
+                    "at": time.time(),
+                },
             )
             assert unavailable is not None
             record = unavailable
@@ -744,7 +792,11 @@ class MonitorService:
         }
 
     async def _read_thread_observations(
-        self, app_server: Any, targets: Sequence[str]
+        self,
+        app_server: Any,
+        targets: Sequence[str],
+        *,
+        fail_on_error: bool = False,
     ) -> dict[str, Mapping[str, Any] | None]:
         """Pre-read every thread_idle child so evaluation stays synchronous."""
 
@@ -753,9 +805,30 @@ class MonitorService:
             try:
                 child = await app_server.read_observation(child_id)
             except AppServerError:
+                if fail_on_error:
+                    raise
                 observations[child_id] = None
             else:
                 observations[child_id] = self._thread_observation_summary(child)
+        return observations
+
+    async def _read_native_worker_observations(
+        self,
+        app_server: Any,
+        requests: Sequence[tuple[str, str, str | None, str | None]],
+    ) -> dict[tuple[str, str, str | None, str | None], Mapping[str, Any]]:
+        """Read exact Core-owned native invocation facts for synchronous evaluation."""
+
+        observations = {}
+        for root_id, task_name, child_id, invocation_id in requests:
+            observations[(root_id, task_name, child_id, invocation_id)] = (
+                await app_server.observe_native_worker(
+                    root_thread_id=root_id,
+                    task_name=task_name,
+                    child_thread_id=child_id,
+                    invocation_id=invocation_id,
+                )
+            )
         return observations
 
     @staticmethod
@@ -777,9 +850,12 @@ class MonitorService:
         referenced = self.ledger.get(rearm_of)
         if referenced is None:
             raise ValidationError(f"rearm_of names an unknown monitor: {rearm_of}")
-        if not is_terminal(referenced.state):
+        if (
+            not is_terminal(referenced.state)
+            and referenced.state != MonitorState.QUEUE_ACCEPTED
+        ):
             raise ValidationError(
-                "rearm_of must name a terminal monitor; a live monitor cannot be a lineage parent"
+                "rearm_of must name a monitor with a consumed trigger and delivery attempt"
             )
 
     def _rearm_chain(self, record: MonitorRecord) -> list[str]:
@@ -1598,6 +1674,9 @@ class MonitorService:
                 if record.state == MonitorState.ARMED:
                     observer_context = self.observer_context_factory()
                     children = thread_idle_targets(record.condition)
+                    native_workers = native_worker_observation_requests(
+                        record.condition
+                    )
                     if record.mode == MonitorMode.DEFERRED:
                         if not record.idle_barrier:
                             # A deferred row without its idle barrier is a
@@ -1624,11 +1703,16 @@ class MonitorService:
                             if current is not None and current.state != MonitorState.ARMED:
                                 transitions.append(self.status(current.monitor_id))
                             continue
-                    elif children:
+                    elif children or native_workers:
                         async with self.app_server_factory() as app_server:
                             observer_context.thread_observations.update(
                                 await self._read_thread_observations(
                                     app_server, children
+                                )
+                            )
+                            observer_context.native_worker_observations.update(
+                                await self._read_native_worker_observations(
+                                    app_server, native_workers
                                 )
                             )
                     claimed = self._evaluate_and_claim(record, observer_context)
@@ -1868,23 +1952,7 @@ class MonitorService:
         try:
             async with adapter as app_server:
                 if record.state == MonitorState.CLAIMED:
-                    try:
-                        capability = await app_server.preflight_thread_delivery(
-                            thread_id
-                        )
-                    except AppServerError as exc:
-                        return self.ledger.update_thread_delivery(
-                            record.monitor_id,
-                            expected=(MonitorState.CLAIMED,),
-                            state=MonitorState.DELIVERY_CAPABILITY_UNAVAILABLE,
-                            delivery_state=ThreadDeliveryState.DELIVERY_REJECTED,
-                            delivery_outcome={
-                                "kind": "delivery_capability_unavailable",
-                                "error": str(exc),
-                                "at": now,
-                            },
-                            now=now,
-                        )
+                    capability = await app_server.preflight_thread_delivery(thread_id)
                     admitted = self.ledger.begin_thread_admission(
                         record.monitor_id,
                         capability=capability,
@@ -1998,6 +2066,32 @@ class MonitorService:
                     expected_pointer_digest=pointer_digest,
                 )
         except AppServerError as exc:
+            if record.state == MonitorState.CLAIMED:
+                if isinstance(exc, AppServerTransportError):
+                    return self.ledger.update_thread_delivery(
+                        record.monitor_id,
+                        expected=(MonitorState.CLAIMED,),
+                        state=MonitorState.CLAIMED,
+                        delivery_state=ThreadDeliveryState.UNATTEMPTED,
+                        reconciliation={
+                            "classification": "preflight_transport_unavailable",
+                            "error": str(exc),
+                            "at": now,
+                        },
+                        now=now,
+                    )
+                return self.ledger.update_thread_delivery(
+                    record.monitor_id,
+                    expected=(MonitorState.CLAIMED,),
+                    state=MonitorState.DELIVERY_CAPABILITY_UNAVAILABLE,
+                    delivery_state=ThreadDeliveryState.DELIVERY_REJECTED,
+                    delivery_outcome={
+                        "kind": "delivery_capability_unavailable",
+                        "error": str(exc),
+                        "at": now,
+                    },
+                    now=now,
+                )
             offline = dict(record.reconciliation or {})
             offline.update(
                 {

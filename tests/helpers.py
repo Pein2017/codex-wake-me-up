@@ -61,6 +61,7 @@ class FakeAppServer:
         pause: TargetObservation | Exception | None = None,
         on_pause: Callable[[], None] | None = None,
         thread_observations: Mapping[str, Any] | None = None,
+        native_worker_observations: Mapping[str, Any] | None = None,
     ):
         self.observations = deque(observations)
         self.last_observation: TargetObservation | None = None
@@ -74,6 +75,8 @@ class FakeAppServer:
         # may be one observation, a list consumed in order, or an exception.
         self.thread_observations = dict(thread_observations or {})
         self.child_reads: list[str] = []
+        self.native_worker_observations = dict(native_worker_observations or {})
+        self.native_worker_reads: list[dict[str, str | None]] = []
 
     async def __aenter__(self) -> "FakeAppServer":
         return self
@@ -97,6 +100,32 @@ class FakeAppServer:
             self.last_observation = self.observations.popleft()
         assert self.last_observation is not None
         return self.last_observation
+
+    async def observe_native_worker(
+        self,
+        *,
+        root_thread_id: str,
+        task_name: str,
+        child_thread_id: str | None = None,
+        invocation_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        self.native_worker_reads.append(
+            {
+                "root_thread_id": root_thread_id,
+                "task_name": task_name,
+                "child_thread_id": child_thread_id,
+                "invocation_id": invocation_id,
+            }
+        )
+        scripted = self.native_worker_observations[task_name]
+        if isinstance(scripted, list):
+            if len(scripted) > 1:
+                scripted = scripted.pop(0)
+            else:
+                scripted = scripted[0]
+        if isinstance(scripted, Exception):
+            raise scripted
+        return scripted
 
     async def activate_guarded_goal(self, thread_id: str) -> TargetObservation:
         self.activation_calls.append(thread_id)

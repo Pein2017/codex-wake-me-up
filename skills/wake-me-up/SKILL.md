@@ -1,13 +1,14 @@
 ---
 name: wake-me-up
-description: Use when a same-host GPU, tmux, PID, log-producing job, or local Codex thread will block the current task for at least 15 minutes and no useful independent work remains, especially when a root or subagent should become idle until an event.
+description: Use when an ordinary native Codex worker should hand off asynchronously, or when same-host work will block the current task for at least 15 minutes and no useful independent work remains.
 ---
 
 # Wake Me Up
 
-Use this only when same-host work will block for at least 15 minutes and no
-useful independent work remains. The producer must keep running after the model
-turn ends: use tmux, a durable worker, another active Codex thread, or another
+Use this for an ordinary native Codex worker that should hand off asynchronously,
+or when other same-host work will block for at least 15 minutes and no useful
+independent work remains. The producer must keep running after the model turn ends:
+use a native worker, tmux, a durable worker, another active Codex thread, or another
 host-local process with a stable witness.
 
 ## Ordinary lifecycle
@@ -17,7 +18,8 @@ host-local process with a stable witness.
    that launcher and retain the returned non-secret `monitor_condition`. A
    foreground tool call does not become durable merely because the turn ends.
 2. Choose the strongest condition the producer can bind:
-   `command_terminal` or `worker_terminal`; monitor-bound `receipt_success`;
+   `native_worker_terminal` for an ordinary spawned Codex worker;
+   `command_terminal` or cooperative `worker_terminal`; monitor-bound `receipt_success`;
    the producer's success-and-failure log or receipt through `log_pattern`;
    `any(log_pattern, pid_exit(actual producer))`; then bare `pid_exit`.
    `tmux_exit`, GPU state, deadlines, and thread idle are weaker lifecycle or
@@ -63,13 +65,20 @@ host-local process with a stable witness.
    delivery facts, abnormal delivery diagnostics, and terminal-event evidence.
    Decide from it without calling an additional details endpoint.
 
-For a cooperative native L1 or HarnessDock worker, reserve a `worker_terminal`
-event first. A scoped worker may publish `delivered`; a settlement-only worker
-may publish `completed` with no candidate, attestation, success, or acceptance.
-The launcher preflights its private mode-0600 descriptor before work and later
-publishes a separate mode-0600 event file; never put its bearer in arguments or
-output. A worker that exits before this final publish is not observed as settled:
-the monitor waits for expiry. Host-observed ThreadId integration is deferred.
+For an ordinary spawned Codex worker, use
+`{"type":"native_worker_terminal","task_name":"/root/worker"}` with the
+canonical name returned by spawn. Core freezes its exact child thread and turn
+invocation; completed, failed, and interrupted all wake as settlement,
+never success. `bindPending` does not arm; remain active until an exact invocation
+is observable. A later follow-up is a new invocation and needs a fresh monitor.
+
+For a cooperative launcher or HarnessDock worker, reserve a `worker_terminal`
+event first. A scoped worker may publish `delivered`; a settlement-only worker may
+publish `completed` with no candidate, attestation, success, or acceptance. The
+launcher preflights its private mode-0600 descriptor before work and later publishes
+a separate mode-0600 event file; never put its bearer in arguments or output. A
+worker that exits before this final publish is not observed as settled and waits
+for expiry.
 
 ## Condition rules
 
@@ -103,7 +112,9 @@ the monitor waits for expiry. Host-observed ThreadId integration is deferred.
 - Do not scrape a launcher's private runtime, scan processes to discover one,
   add shell/tmux adapters, or automatically re-arm after a wake.
 - For a new occurrence after handling the wake, an agent may explicitly call a
-  fresh `wait_for_event` with a new key and `rearm_of`; nothing re-arms itself.
+  fresh `wait_for_event` with a new key and `rearm_of`; a prior thread monitor
+  may already be `queue_accepted`, but remains nonterminal and is never resent.
+  Nothing re-arms itself.
 - Use one composed `all` monitor to wake after every worker settles. For
   continuing first-settlement control, arm independent single-leaf monitors;
   retain or cancel survivors explicitly. Typed `any` consumes losers.
@@ -114,7 +125,7 @@ the monitor waits for expiry. Host-observed ThreadId integration is deferred.
   and rollback: [references/terminal-events.md](references/terminal-events.md)
 - Queue admission, reconciliation, modified/uncertain delivery, and cancellation:
   [references/queue-reconciliation.md](references/queue-reconciliation.md)
-- Spawned-subagent root routing and `thread_idle`:
+- Spawned-subagent root routing, native settlement, and `thread_idle`:
   [references/subagents-and-thread-idle.md](references/subagents-and-thread-idle.md)
 - Explicit legacy paused-goal delivery and its expiry/guard semantics:
   [references/legacy-goal-delivery.md](references/legacy-goal-delivery.md)

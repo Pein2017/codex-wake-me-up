@@ -2,8 +2,8 @@
   "mcpServers": {
     "codex_wake_me_up": {
       "type": "stdio",
-      "command": "python",
-      "args": ["./scripts/mcp_server.py"],
+      "command": "conda",
+      "args": ["run", "--no-capture-output", "-n", "ms", "python", "-u", "./scripts/mcp_server.py"],
       "cwd": ".",
       "required": false,
       "supports_parallel_tool_calls": false,

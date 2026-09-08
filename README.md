@@ -219,8 +219,8 @@ claims:
   or absent: only scoped `delivered` names a candidate commit and receives
   read-only attestation. `completed` has no candidate, attestation, task
   success, or lead acceptance. If a cooperative native worker exits before its
-  final publish, the monitor wakes only at expiry; a host-observed ThreadId
-  integration is deferred until that counterexample justifies it.
+  final publish, the monitor wakes only at expiry. Ordinary Codex native workers
+  instead use the host-observed `native_worker_terminal` condition below.
 
 Every command terminal outcome wakes when bound, including succeeded, failed,
 cancelled, and signaled. Every worker terminal outcome also wakes when bound,
@@ -360,6 +360,30 @@ the current turn, not behind an expiry-length wait. Pass
 the child's runtime status, goal status, and usage snapshot. An ended turn is
 not task success; read the child's actual output.
 
+### `native_worker_terminal`
+
+```json
+{"type": "native_worker_terminal", "task_name": "/root/worker"}
+```
+
+For goal-independent thread delivery, binds the public canonical task name under
+the trusted root to Core's exact child thread and persisted turn invocation. Every
+later observation supplies both frozen identities, so a `followup_task` that reuses
+the task and child thread cannot replace the invocation being watched.
+
+`completed`, `failed`, and `interrupted` settle that exact invocation
+with distinct evidence. Each is settlement only: `task_success=false` and
+`lead_accepted=false`. `running` remains false. `bindPending` rejects before row
+creation because there is no invocation to freeze yet; unavailable history,
+disappearance, or identity mismatch wakes through the fail-closed observer path.
+An invocation already settled when registration binds is latched and wakes on the
+next daemon evaluation. Compose native workers with the existing `any` or `all`;
+the selected monitor still makes only one root queue-add attempt.
+
+This is not `thread_idle`: unloading and generic idle are not native settlement.
+It is also not cooperative `worker_terminal`, which remains the richer publisher
+contract for candidates and attestations.
+
 ### `receipt_success`
 
 ```json
@@ -466,10 +490,13 @@ does not itself consume model input tokens.
 ### Re-arm lineage
 
 Both registration tools accept an optional `rearm_of: <monitor-id>` naming the
-terminal monitor a new one succeeds. It is validated (the reference must exist
-and be terminal), stored, and surfaced as a `rearm_chain` in `status` and
-`list`. Lineage is archival only: no guard, condition, authorization, or state
-is inherited, and every safety check runs fresh.
+monitor a new one succeeds. The reference must exist and either be terminal or
+be a thread delivery in `queue_accepted`, where the one trigger and queue-add
+attempt have already been consumed but history reconciliation is still live.
+It is stored and surfaced as a `rearm_chain` in `status` and `list`. Lineage is
+archival only: no guard, condition, authorization, delivery, success claim, or
+state is inherited, and every safety check runs fresh. In particular,
+`queue_accepted` remains nonterminal and is never sent again.
 
 Nothing re-arms automatically — each arm is a consent-carrying call by an agent
 that just saw the previous wake's evidence. This wake → handle → re-defer loop
@@ -481,6 +508,12 @@ non-goal.
 An armed registration starts a detached same-host daemon owning a file lock and
 heartbeat. If it is absent after a reboot or failure, `status` reports
 `unsupervised` rather than claiming the monitor is healthy.
+
+Thread registration failures identify the bounded stage. Delivery-daemon
+readiness additionally reports the current heartbeat, process, capability,
+source, or lock mismatch; target resolution and condition preparation retain
+the exact app-server method error. These diagnostics do not retry, extend the
+timeout, or claim that current state explains a historical timeout.
 
 ```bash
 codex-wake-me-up doctor --thread-id <loaded-thread-id>

@@ -110,6 +110,10 @@ class AppServerError(WakeMeUpError):
     """The local Codex app-server could not provide a conclusive response."""
 
 
+class AppServerTransportError(AppServerError):
+    """The app-server request failed before a conclusive response arrived."""
+
+
 class AppServerRejectedError(AppServerError):
     """The app-server conclusively rejected a validly transported request."""
 

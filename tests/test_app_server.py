@@ -1,5 +1,6 @@
 import asyncio
 
+import aiohttp
 import pytest
 
 from codex_wake_me_up.app_server import (
@@ -8,7 +9,11 @@ from codex_wake_me_up.app_server import (
     initialize_params,
     pause_params,
 )
-from codex_wake_me_up.models import AppServerError
+from codex_wake_me_up.models import (
+    AppServerError,
+    AppServerRejectedError,
+    AppServerTransportError,
+)
 from pathlib import Path
 
 
@@ -29,6 +34,54 @@ def test_thread_delivery_connection_explicitly_enables_experimental_api() -> Non
     assert initialize_params(experimental_api=False)["capabilities"][
         "experimentalApi"
     ] is False
+
+
+def test_request_timeout_is_typed_as_transport_failure(tmp_path) -> None:
+    """Keeps a read timeout distinct from a conclusive capability denial."""
+
+    class TimedOutWebsocket:
+        async def send_json(self, _payload) -> None:
+            return None
+
+        async def receive(self):
+            await asyncio.Future()
+
+    client = AppServerClient(tmp_path, timeout_seconds=0.001)
+    client._websocket = TimedOutWebsocket()
+
+    with pytest.raises(AppServerTransportError, match="thread/read timed out"):
+        asyncio.run(client._request("thread/read", {"threadId": "thread-1"}))
+
+
+def test_socket_stat_permission_failure_is_definitive(tmp_path) -> None:
+    class DeniedSocket:
+        def stat(self):
+            raise PermissionError("denied")
+
+    client = AppServerClient(tmp_path)
+    client.socket_path = DeniedSocket()
+
+    with pytest.raises(AppServerError) as caught:
+        client._check_socket()
+
+    assert type(caught.value) is AppServerError
+
+
+def test_websocket_handshake_rejection_is_definitive(tmp_path, monkeypatch) -> None:
+    async def reject_handshake(*_args, **_kwargs):
+        raise aiohttp.WSServerHandshakeError(
+            None, (), status=403, message="Forbidden", headers=None
+        )
+
+    monkeypatch.setattr(AppServerClient, "_check_socket", lambda _self: None)
+    monkeypatch.setattr(aiohttp.ClientSession, "ws_connect", reject_handshake)
+
+    async def connect() -> None:
+        async with AppServerClient(tmp_path):
+            raise AssertionError("handshake rejection must not enter the context")
+
+    with pytest.raises(AppServerRejectedError, match="HTTP 403"):
+        asyncio.run(connect())
 
 
 def test_goal_set_observation_preserves_returned_thread_identity() -> None:
@@ -147,6 +200,81 @@ def test_read_observation_accepts_matching_positive_thread_identities() -> None:
     result = asyncio.run(StubClient().read_observation("requested"))
     assert result.thread_id == "requested"
     assert result.goal_status == "paused"
+
+
+def test_native_worker_observer_binds_then_reads_one_exact_invocation() -> None:
+    class StubClient(AppServerClient):
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def _request(self, method, params):
+            self.calls.append((method, params))
+            return {
+                "taskName": params["taskName"],
+                "childThreadId": "child-1",
+                "invocationId": "turn-1",
+                "status": "running",
+            }
+
+    client = StubClient()
+    bound = asyncio.run(
+        client.observe_native_worker(
+            root_thread_id="root-1",
+            task_name="/root/worker",
+        )
+    )
+    observed = asyncio.run(
+        client.observe_native_worker(
+            root_thread_id="root-1",
+            task_name="/root/worker",
+            child_thread_id="child-1",
+            invocation_id="turn-1",
+        )
+    )
+
+    assert bound == observed == {
+        "task_name": "/root/worker",
+        "child_thread_id": "child-1",
+        "invocation_id": "turn-1",
+        "status": "running",
+        "error": None,
+    }
+    assert client.calls == [
+        (
+            "thread/agent/observe",
+            {"rootThreadId": "root-1", "taskName": "/root/worker"},
+        ),
+        (
+            "thread/agent/observe",
+            {
+                "rootThreadId": "root-1",
+                "taskName": "/root/worker",
+                "childThreadId": "child-1",
+                "invocationId": "turn-1",
+            },
+        ),
+    ]
+
+
+def test_native_worker_observer_accepts_core_bounded_non_ascii_error() -> None:
+    class StubClient(AppServerClient):
+        async def _request(self, _method, params):
+            return {
+                "taskName": params["taskName"],
+                "childThreadId": "child-1",
+                "invocationId": "turn-1",
+                "status": "failed",
+                "error": "错" * 512,
+            }
+
+    result = asyncio.run(
+        StubClient().observe_native_worker(
+            root_thread_id="root-1",
+            task_name="/root/worker",
+        )
+    )
+
+    assert result["error"] == "错" * 512
 
 
 def test_delivery_code_has_no_child_continuation_or_alternate_start_surface() -> None:

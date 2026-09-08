@@ -13,6 +13,7 @@ from codex_wake_me_up.runtime import (
     EVENT_CAPABILITY_EPOCH,
     atomic_write_json,
     daemon_delivery_capable,
+    delivery_daemon_unready_reason,
     daemon_event_capable,
     daemon_is_healthy,
     ensure_daemon_ready,
@@ -106,6 +107,61 @@ def test_daemon_heartbeat_advertises_exact_event_epoch_and_source(tmp_path) -> N
 
     assert not daemon_event_capable(tmp_path)
     assert not daemon_delivery_capable(tmp_path)
+
+
+def test_delivery_daemon_diagnosis_distinguishes_bounded_readiness_failures(
+    tmp_path,
+) -> None:
+    now = time.time()
+    assert delivery_daemon_unready_reason(tmp_path) == "missing_heartbeat"
+
+    heartbeat_path(tmp_path).write_text("not json", encoding="utf-8")
+    assert delivery_daemon_unready_reason(tmp_path) == "malformed_heartbeat"
+
+    cases = (
+        ({"pid": os.getpid(), "at": now, "accepting_work": False}, "retiring_owner"),
+        ({"pid": os.getpid(), "at": now - 60}, "stale_heartbeat"),
+        ({"pid": 2**31 - 1, "at": now}, "dead_process"),
+        (
+            {
+                "pid": os.getpid(),
+                "at": now,
+                "delivery_capability_epoch": 0,
+                "event_capability_epoch": EVENT_CAPABILITY_EPOCH,
+                "loaded_source_identity": loaded_source_identity(),
+            },
+            "delivery_capability_epoch_mismatch",
+        ),
+        (
+            {
+                "pid": os.getpid(),
+                "at": now,
+                "delivery_capability_epoch": DELIVERY_CAPABILITY_EPOCH,
+                "event_capability_epoch": 0,
+                "loaded_source_identity": loaded_source_identity(),
+            },
+            "event_capability_epoch_mismatch",
+        ),
+        (
+            {
+                "pid": os.getpid(),
+                "at": now,
+                "delivery_capability_epoch": DELIVERY_CAPABILITY_EPOCH,
+                "event_capability_epoch": EVENT_CAPABILITY_EPOCH,
+                "loaded_source_identity": "old-source",
+            },
+            "source_identity_mismatch",
+        ),
+    )
+    for payload, reason in cases:
+        atomic_write_json(heartbeat_path(tmp_path), payload)
+        assert delivery_daemon_unready_reason(tmp_path) == reason
+
+    write_heartbeat(tmp_path)
+    assert delivery_daemon_unready_reason(tmp_path) == "lock_owner_mismatch"
+    with DaemonLock(tmp_path):
+        write_heartbeat(tmp_path)
+        assert delivery_daemon_unready_reason(tmp_path) is None
 
 
 def test_event_capability_requires_the_advertising_pid_to_own_daemon_lock(

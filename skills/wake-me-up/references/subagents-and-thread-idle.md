@@ -1,7 +1,7 @@
 # Spawned subagents and thread idle
 
 Read this when a spawned Codex worker arms the monitor or when the condition is
-`thread_idle`.
+`native_worker_terminal` or `thread_idle`.
 
 For an exact `thread_spawn` V2 child, trusted metadata records that child as the
 origin and follows its validated parent chain to the topmost root. Only the root
@@ -18,6 +18,17 @@ When the condition fires, root reads
 `wake_me_up_status(monitor_id, view="decision")` exactly once and decides whether
 to continue itself, activate a proven child continuation path, or stop. The
 plugin never resumes, recreates, follows up, or accepts a child.
+
+`{"type":"native_worker_terminal","task_name":"/root/worker"}` is the exact
+native settlement leaf. Registration resolves the public canonical task name
+under the trusted root and freezes both its child thread and persisted turn
+invocation. `running` remains false; `completed`, `failed`, and `interrupted`
+settle with distinct evidence and no task-success or lead-acceptance
+claim. `bindPending` cannot arm because no exact invocation exists yet.
+Disappearance or identity mismatch fails closed. A later `followup_task` reuses the
+child thread but creates a new invocation, so it needs a fresh monitor rather than
+silently satisfying the old one. Existing `any` and `all` compose these leaves and
+retain the single root queue path.
 
 `{"type":"thread_idle","thread_id":"<child>"}` observes a locally loaded
 thread ending its turn. A child already idle is rejected unless

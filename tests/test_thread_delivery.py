@@ -23,6 +23,7 @@ from codex_wake_me_up.ledger import Ledger
 from codex_wake_me_up.models import (
     AppServerError,
     AppServerRejectedError,
+    AppServerTransportError,
     ConflictError,
     GoalMarker,
     MonitorState,
@@ -159,6 +160,24 @@ class FakeThreadDelivery:
         return True
 
 
+def _native_worker_snapshot(
+    status: str,
+    *,
+    task_name: str = "/root/worker",
+    child_thread_id: str | None = "child-1",
+    invocation_id: str | None = "turn-1",
+    error: str | None = None,
+) -> dict:
+    snapshot = {"task_name": task_name, "status": status}
+    if child_thread_id is not None:
+        snapshot["child_thread_id"] = child_thread_id
+    if invocation_id is not None:
+        snapshot["invocation_id"] = invocation_id
+    if error is not None:
+        snapshot["error"] = error
+    return snapshot
+
+
 def _thread_service(
     tmp_path,
     adapter: FakeThreadDelivery,
@@ -207,6 +226,314 @@ def test_thread_delivery_records_daemon_unavailable_when_retirement_wins_second_
 
     assert result["state"] == MonitorState.DAEMON_UNAVAILABLE
     assert result["outcome"]["kind"] == "delivery_daemon_mismatch_before_arm"
+
+
+def test_thread_delivery_readiness_failure_reports_current_stage_and_reason(
+    tmp_path,
+) -> None:
+    service = _thread_service(
+        tmp_path,
+        FakeThreadDelivery(),
+        Clock(),
+        thread_ready=lambda _root: False,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="stage=delivery_daemon_readiness reason=missing_heartbeat",
+    ):
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="thread-1",
+                condition={"type": "time", "after_seconds": 10},
+                expires_in_seconds=100,
+                idempotency_key="daemon-not-ready",
+                start_daemon=False,
+            )
+        )
+
+
+def test_thread_delivery_resolution_timeout_reports_stage_before_row_creation(
+    tmp_path,
+) -> None:
+    class TimedOutDelivery(FakeThreadDelivery):
+        async def resolve_thread_delivery(self, _thread_id: str) -> dict:
+            raise AppServerError("app-server thread/read timed out")
+
+    service = _thread_service(tmp_path, TimedOutDelivery(), Clock())
+
+    with pytest.raises(AppServerError, match="stage=resolve_delivery_target"):
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="thread-1",
+                condition={"type": "time", "after_seconds": 10},
+                expires_in_seconds=100,
+                idempotency_key="resolution-timeout",
+                start_daemon=False,
+            )
+        )
+    assert service.ledger.list() == []
+
+
+def test_thread_condition_read_timeout_reports_stage_before_row_creation(
+    tmp_path,
+) -> None:
+    service = _thread_service(
+        tmp_path,
+        FakeThreadDelivery(),
+        Clock(),
+        observer_adapter=FakeAppServer(
+            [],
+            thread_observations={
+                "child": AppServerError("app-server thread/read timed out")
+            },
+        ),
+    )
+
+    with pytest.raises(AppServerError, match="stage=prepare_condition"):
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="thread-1",
+                condition={"type": "thread_idle", "thread_id": "child"},
+                expires_in_seconds=100,
+                idempotency_key="condition-timeout",
+                start_daemon=False,
+            )
+        )
+    assert service.ledger.list() == []
+
+
+def test_native_worker_bind_pending_does_not_arm_ambiguous_subscription(
+    tmp_path,
+) -> None:
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/worker": _native_worker_snapshot(
+                "bindPending", child_thread_id=None, invocation_id=None
+            )
+        },
+    )
+    service = _thread_service(
+        tmp_path, FakeThreadDelivery(), Clock(), observer_adapter=observer
+    )
+
+    with pytest.raises(ValidationError, match="has no exact invocation yet"):
+        asyncio.run(
+            service.wait_for_current_event(
+                thread_id="root-1",
+                condition={
+                    "type": "native_worker_terminal",
+                    "task_name": "/root/worker",
+                },
+                expires_in_seconds=100,
+                idempotency_key="native-bind-pending",
+                start_daemon=False,
+            )
+        )
+
+    assert service.ledger.list() == []
+
+
+def test_native_worker_requires_trusted_current_root_binding(tmp_path) -> None:
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/worker": _native_worker_snapshot("running")
+        },
+    )
+    service = _thread_service(
+        tmp_path, FakeThreadDelivery(), Clock(), observer_adapter=observer
+    )
+
+    with pytest.raises(ValidationError, match="trusted current root"):
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="root-1",
+                condition={
+                    "type": "native_worker_terminal",
+                    "task_name": "/root/worker",
+                },
+                expires_in_seconds=100,
+                idempotency_key="native-untrusted-root",
+                start_daemon=False,
+            )
+        )
+
+    assert observer.native_worker_reads == []
+    assert service.ledger.list() == []
+
+
+def test_native_worker_completed_before_arm_is_latched_and_wakes_once(tmp_path) -> None:
+    delivery = FakeThreadDelivery()
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/worker": _native_worker_snapshot("completed")
+        },
+    )
+    service = _thread_service(
+        tmp_path, delivery, Clock(), observer_adapter=observer
+    )
+
+    receipt = asyncio.run(
+        service.wait_for_current_event(
+            thread_id="root-1",
+            condition={
+                "type": "native_worker_terminal",
+                "task_name": "/root/worker",
+            },
+            expires_in_seconds=100,
+            idempotency_key="native-already-completed",
+            start_daemon=False,
+        )
+    )
+    asyncio.run(service.reconcile_once())
+    decision = service.decision_status(receipt["monitor_id"])
+
+    assert decision["state"] == MonitorState.QUEUE_ACCEPTED
+    witness = decision["witness"][0]["evidence"]
+    assert witness["status"] == "completed"
+    assert witness["task_success"] is False
+    assert witness["lead_accepted"] is False
+    assert len(observer.native_worker_reads) == 1
+    assert len(delivery.add_calls) == 1
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
+def test_native_worker_exact_invocation_terminal_statuses_are_settlement_only(
+    tmp_path, terminal_status
+) -> None:
+    delivery = FakeThreadDelivery()
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/worker": [
+                _native_worker_snapshot("running"),
+                _native_worker_snapshot(terminal_status),
+            ]
+        },
+    )
+    service = _thread_service(
+        tmp_path, delivery, Clock(), observer_adapter=observer
+    )
+    receipt = asyncio.run(
+        service.wait_for_current_event(
+            thread_id="root-1",
+            condition={
+                "type": "native_worker_terminal",
+                "task_name": "/root/worker",
+            },
+            expires_in_seconds=100,
+            idempotency_key=f"native-{terminal_status}",
+            start_daemon=False,
+        )
+    )
+
+    asyncio.run(service.reconcile_once())
+    decision = service.decision_status(receipt["monitor_id"])
+
+    assert observer.native_worker_reads[-1] == {
+        "root_thread_id": "root-1",
+        "task_name": "/root/worker",
+        "child_thread_id": "child-1",
+        "invocation_id": "turn-1",
+    }
+    assert decision["state"] == MonitorState.QUEUE_ACCEPTED
+    witness = decision["witness"][0]["evidence"]
+    assert witness["status"] == terminal_status
+    assert witness["task_success"] is False
+    assert witness["lead_accepted"] is False
+    assert len(delivery.add_calls) == 1
+
+
+@pytest.mark.parametrize("failure_status", ["unavailable", "mismatch"])
+def test_native_worker_disappearance_or_invocation_mismatch_wakes_fail_closed(
+    tmp_path, failure_status
+) -> None:
+    delivery = FakeThreadDelivery()
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/worker": [
+                _native_worker_snapshot("running"),
+                _native_worker_snapshot(
+                    failure_status, error="exact invocation is unavailable"
+                ),
+            ]
+        },
+    )
+    service = _thread_service(
+        tmp_path, delivery, Clock(), observer_adapter=observer
+    )
+    receipt = asyncio.run(
+        service.wait_for_current_event(
+            thread_id="root-1",
+            condition={
+                "type": "native_worker_terminal",
+                "task_name": "/root/worker",
+            },
+            expires_in_seconds=100,
+            idempotency_key=f"native-{failure_status}",
+            start_daemon=False,
+        )
+    )
+
+    asyncio.run(service.reconcile_once())
+    decision = service.decision_status(receipt["monitor_id"])
+
+    assert decision["state"] == MonitorState.QUEUE_ACCEPTED
+    assert decision["wake_reason"] == "observer_failed"
+    assert decision["failure_detail"]["kind"] == failure_status
+    assert decision.get("task_success") is not True
+    assert len(delivery.add_calls) == 1
+
+
+@pytest.mark.parametrize(("condition_type", "polls"), [("any", 1), ("all", 2)])
+def test_native_worker_composition_uses_one_root_queue_add(
+    tmp_path, condition_type, polls
+) -> None:
+    delivery = FakeThreadDelivery()
+    observer = FakeAppServer(
+        [],
+        native_worker_observations={
+            "/root/a": [
+                _native_worker_snapshot("running", task_name="/root/a"),
+                _native_worker_snapshot("completed", task_name="/root/a"),
+            ],
+            "/root/b": [
+                _native_worker_snapshot("running", task_name="/root/b"),
+                _native_worker_snapshot("running", task_name="/root/b"),
+                _native_worker_snapshot("failed", task_name="/root/b"),
+            ],
+        },
+    )
+    service = _thread_service(
+        tmp_path, delivery, Clock(), observer_adapter=observer
+    )
+    receipt = asyncio.run(
+        service.wait_for_current_event(
+            thread_id="root-1",
+            condition={
+                "type": condition_type,
+                "children": [
+                    {"type": "native_worker_terminal", "task_name": "/root/a"},
+                    {"type": "native_worker_terminal", "task_name": "/root/b"},
+                ],
+            },
+            expires_in_seconds=100,
+            idempotency_key=f"native-{condition_type}",
+            start_daemon=False,
+        )
+    )
+
+    for index in range(polls):
+        asyncio.run(service.reconcile_once())
+        if condition_type == "all" and index == 0:
+            assert service.status(receipt["monitor_id"])["state"] == MonitorState.ARMED
+
+    assert service.status(receipt["monitor_id"])["state"] == MonitorState.QUEUE_ACCEPTED
+    assert len(delivery.add_calls) == 1
 
 
 def test_thread_pointer_is_stable_bounded_and_contains_no_wake_evidence() -> None:
@@ -998,6 +1325,179 @@ def test_thread_delivery_consumes_one_add_and_reconciles_queue_without_readd(
     assert second["reconciliation"]["classification"] == "queued"
 
 
+def test_claimed_delivery_retries_only_transient_preflight_before_one_add(
+    tmp_path,
+) -> None:
+    """Reproduces the claimed wake lost by a transient thread/read timeout."""
+
+    clock = Clock()
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, clock)
+    registered = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="preflight-recovers",
+            start_daemon=False,
+        )
+    )
+    original_preflight = adapter.preflight_thread_delivery
+    failures = iter(
+        [
+            AppServerTransportError("app-server thread/read timed out"),
+            AppServerTransportError("app-server thread/read timed out"),
+        ]
+    )
+
+    async def flaky_preflight(thread_id: str) -> dict:
+        failure = next(failures, None)
+        if failure is not None:
+            adapter.preflight_calls.append(thread_id)
+            raise failure
+        return await original_preflight(thread_id)
+
+    adapter.preflight_thread_delivery = flaky_preflight
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    first = service.status(registered["monitor_id"])
+
+    assert first["state"] == MonitorState.CLAIMED
+    assert first["delivery_state"] == ThreadDeliveryState.UNATTEMPTED
+    assert first["admission_attempted_at"] is None
+    assert first["queue_receipt"] is None
+    assert first["reconciliation"]["classification"] == (
+        "preflight_transport_unavailable"
+    )
+    assert adapter.add_calls == []
+
+    # Trigger expiry bounds observation only; an already claimed delivery stays
+    # pending until preflight recovers or the user cancels it.
+    clock.value = 201.0
+    asyncio.run(service.reconcile_once())
+    second = service.status(registered["monitor_id"])
+    assert second["state"] == MonitorState.CLAIMED
+    assert second["admission_attempted_at"] is None
+    assert adapter.add_calls == []
+
+    clock.value = 202.0
+    asyncio.run(service.reconcile_once())
+    recovered = service.status(registered["monitor_id"])
+
+    assert recovered["state"] == MonitorState.QUEUE_ACCEPTED
+    assert recovered["admission_attempted_at"] == 202.0
+    assert recovered["queue_receipt"]["item_id"] == "queue-1"
+    assert len(adapter.add_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AppServerRejectedError("target does not accept direct input"),
+        AppServerError("app-server CODEX_HOME does not match the local runtime root"),
+        AppServerError("thread/read returned no runtime status"),
+    ],
+)
+def test_claimed_delivery_definitive_preflight_denial_is_terminal(
+    tmp_path, failure
+) -> None:
+    clock = Clock()
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, clock)
+    registered = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="preflight-denied",
+            start_daemon=False,
+        )
+    )
+
+    async def deny_preflight(thread_id: str) -> dict:
+        adapter.preflight_calls.append(thread_id)
+        raise failure
+
+    adapter.preflight_thread_delivery = deny_preflight
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    denied = service.status(registered["monitor_id"])
+
+    assert denied["state"] == MonitorState.DELIVERY_CAPABILITY_UNAVAILABLE
+    assert denied["delivery_state"] == ThreadDeliveryState.DELIVERY_REJECTED
+    assert denied["admission_attempted_at"] is None
+    assert adapter.add_calls == []
+
+
+def test_claimed_delivery_can_be_cancelled_before_preflight_retry(tmp_path) -> None:
+    clock = Clock()
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, clock)
+    registered = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="preflight-cancelled",
+            start_daemon=False,
+        )
+    )
+
+    async def timeout_preflight(thread_id: str) -> dict:
+        adapter.preflight_calls.append(thread_id)
+        raise AppServerTransportError("app-server thread/read timed out")
+
+    adapter.preflight_thread_delivery = timeout_preflight
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    cancelled = service.cancel(registered["monitor_id"])
+    asyncio.run(service.reconcile_once())
+
+    assert cancelled["state"] == MonitorState.CANCELLED
+    assert service.status(registered["monitor_id"])["state"] == MonitorState.CANCELLED
+    assert adapter.add_calls == []
+
+
+def test_queue_accepted_monitor_can_parent_fresh_lineage_without_readd(
+    tmp_path,
+) -> None:
+    """Reproduces a consumed pointer rejected only because recording lagged."""
+
+    clock = Clock()
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, clock)
+    parent = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="consumed-parent",
+            start_daemon=False,
+        )
+    )
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    assert service.status(parent["monitor_id"])["state"] == MonitorState.QUEUE_ACCEPTED
+
+    child = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 10},
+            expires_in_seconds=100,
+            idempotency_key="fresh-child",
+            rearm_of=parent["monitor_id"],
+            start_daemon=False,
+        )
+    )
+
+    parent_status = service.decision_status(parent["monitor_id"])
+    assert parent_status["state"] == MonitorState.QUEUE_ACCEPTED
+    assert parent_status.get("task_success") is not True
+    assert child["state"] == MonitorState.ARMED
+    assert child["rearm_of"] == parent["monitor_id"]
+    assert len(adapter.add_calls) == 1
+
+
 def test_subagent_event_admits_only_to_the_frozen_root_queue(tmp_path) -> None:
     clock = Clock()
     adapter = FakeThreadDelivery(
@@ -1047,7 +1547,7 @@ def test_uncertain_admission_reconciles_online_window_and_never_readds(
         "queue_count": 0,
     }
     adapter = FakeThreadDelivery(
-        add_result=AppServerError("transport uncertain"),
+        add_result=AppServerTransportError("thread/queue/add timed out"),
         inspections=[absent, absent],
     )
     service = _thread_service(tmp_path, adapter, clock)

@@ -11,7 +11,13 @@ from typing import Any, Mapping, cast
 
 import aiohttp
 
-from .models import AppServerError, AppServerRejectedError, GoalMarker, TargetObservation
+from .models import (
+    AppServerError,
+    AppServerRejectedError,
+    AppServerTransportError,
+    GoalMarker,
+    TargetObservation,
+)
 from .runtime import control_socket, resolve_codex_home
 
 
@@ -89,8 +95,26 @@ class AppServerClient:
                         ws_close=self.timeout_seconds,
                     ),
                 )
+            except aiohttp.WSServerHandshakeError as exc:
+                raise AppServerRejectedError(
+                    f"app-server WebSocket handshake rejected request: HTTP {exc.status}"
+                ) from exc
+            except PermissionError as exc:
+                raise AppServerError(
+                    "current user cannot access the app-server control socket"
+                ) from exc
+            except aiohttp.ClientConnectorError as exc:
+                if isinstance(exc.os_error, PermissionError):
+                    raise AppServerError(
+                        "current user cannot access the app-server control socket"
+                    ) from exc
+                raise AppServerTransportError(
+                    "cannot connect to the local app-server socket"
+                ) from exc
             except (aiohttp.ClientError, OSError) as exc:
-                raise AppServerError("cannot connect to the local app-server socket") from exc
+                raise AppServerTransportError(
+                    "cannot connect to the local app-server socket"
+                ) from exc
             initialized = await self._request(
                 "initialize",
                 initialize_params(experimental_api=self.experimental_api),
@@ -118,8 +142,14 @@ class AppServerClient:
     def _check_socket(self) -> None:
         try:
             socket_stat = self.socket_path.stat()
+        except PermissionError as exc:
+            raise AppServerError(
+                "current user cannot access the app-server control socket"
+            ) from exc
         except OSError as exc:
-            raise AppServerError(f"local app-server socket is unavailable: {self.socket_path}") from exc
+            raise AppServerTransportError(
+                f"local app-server socket is unavailable: {self.socket_path}"
+            ) from exc
         if not stat.S_ISSOCK(socket_stat.st_mode):
             raise AppServerError("app-server control path is not a Unix socket")
         if socket_stat.st_uid not in {os.getuid(), 0}:
@@ -131,18 +161,22 @@ class AppServerClient:
 
     async def _send(self, payload: Mapping[str, Any]) -> None:
         if self._websocket is None:
-            raise AppServerError("app-server client is not connected")
+            raise AppServerTransportError("app-server client is not connected")
         try:
             await self._websocket.send_json(dict(payload))
-        except aiohttp.ClientError as exc:
-            raise AppServerError("failed to write to local app-server") from exc
+        except PermissionError as exc:
+            raise AppServerError(
+                "current user cannot access the app-server control socket"
+            ) from exc
+        except (aiohttp.ClientError, OSError) as exc:
+            raise AppServerTransportError("failed to write to local app-server") from exc
 
     async def _request(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         request_id = self._next_request_id
         self._next_request_id += 1
         await self._send({"id": request_id, "method": method, "params": dict(params)})
         if self._websocket is None:
-            raise AppServerError("app-server client is not connected")
+            raise AppServerTransportError("app-server client is not connected")
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 while True:
@@ -170,9 +204,21 @@ class AppServerClient:
                         aiohttp.WSMsgType.CLOSING,
                         aiohttp.WSMsgType.ERROR,
                     }:
-                        raise AppServerError("local app-server WebSocket closed")
+                        raise AppServerTransportError(
+                            "local app-server WebSocket closed"
+                        )
         except TimeoutError as exc:
-            raise AppServerError(f"app-server {method} timed out") from exc
+            raise AppServerTransportError(
+                f"app-server {method} timed out"
+            ) from exc
+        except PermissionError as exc:
+            raise AppServerError(
+                "current user cannot access the app-server control socket"
+            ) from exc
+        except (aiohttp.ClientError, OSError) as exc:
+            raise AppServerTransportError(
+                f"app-server {method} transport failed"
+            ) from exc
 
     async def read_observation(self, thread_id: str) -> TargetObservation:
         thread_result = await self._request(
@@ -283,6 +329,79 @@ class AppServerClient:
                 **dict(server_identity),
                 "user_agent": user_agent,
             },
+        }
+
+    async def observe_native_worker(
+        self,
+        *,
+        root_thread_id: str,
+        task_name: str,
+        child_thread_id: str | None = None,
+        invocation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind or read one exact Core-owned native worker invocation."""
+
+        if not root_thread_id or not task_name:
+            raise AppServerError("native worker root and task identities must be non-empty")
+        if (child_thread_id is None) != (invocation_id is None):
+            raise AppServerError(
+                "native worker child and invocation identities must be supplied together"
+            )
+        params = {"rootThreadId": root_thread_id, "taskName": task_name}
+        if child_thread_id is not None and invocation_id is not None:
+            params.update(
+                {"childThreadId": child_thread_id, "invocationId": invocation_id}
+            )
+        result = await self._request("thread/agent/observe", params)
+        status = result.get("status")
+        if status not in {
+            "bindPending",
+            "running",
+            "interrupted",
+            "completed",
+            "failed",
+            "unavailable",
+            "mismatch",
+        }:
+            raise AppServerError("native worker observation returned an invalid status")
+        if result.get("taskName") != task_name:
+            raise AppServerError("native worker observation returned a different task")
+        returned_child = result.get("childThreadId")
+        returned_invocation = result.get("invocationId")
+        for value, label in (
+            (returned_child, "child thread"),
+            (returned_invocation, "invocation"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise AppServerError(
+                    f"native worker observation returned an invalid {label} identity"
+                )
+        error = result.get("error")
+        if error is not None and (
+            not isinstance(error, str) or len(error) > 512
+        ):
+            raise AppServerError("native worker observation returned an invalid error")
+        if status in {
+            "running",
+            "interrupted",
+            "completed",
+            "failed",
+        } and (returned_child is None or returned_invocation is None):
+            raise AppServerError("native worker observation omitted its exact invocation")
+        if child_thread_id is not None and status not in {"unavailable", "mismatch"}:
+            if (
+                returned_child != child_thread_id
+                or returned_invocation != invocation_id
+            ):
+                raise AppServerError(
+                    "native worker observation changed the exact invocation identity"
+                )
+        return {
+            "task_name": task_name,
+            "child_thread_id": returned_child,
+            "invocation_id": returned_invocation,
+            "status": status,
+            "error": error,
         }
 
     async def resolve_thread_delivery(self, origin_thread_id: str) -> dict[str, Any]:

@@ -20,6 +20,7 @@ from .runtime import read_json
 
 GpuQuery = Callable[[], Mapping[int, float]]
 TmuxRun = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+NativeWorkerObservationKey = tuple[str, str, str | None, str | None]
 
 # Reversible implementation budgets, not contract. They exist so one hostile
 # log line or one enormous append cannot delay every other monitor's poll.
@@ -77,6 +78,10 @@ class ObserverContext:
     thread_observations: dict[str, Mapping[str, Any] | None] = field(
         default_factory=dict
     )
+    native_worker_root_thread_id: str | None = None
+    native_worker_observations: dict[
+        NativeWorkerObservationKey, Mapping[str, Any] | None
+    ] = field(default_factory=dict)
 
 
 def _expect_mapping(value: Any, what: str) -> Mapping[str, Any]:
@@ -327,6 +332,132 @@ def thread_idle_targets(condition: Mapping[str, Any]) -> list[str]:
     return found
 
 
+def native_worker_observation_requests(
+    condition: Mapping[str, Any], *, root_thread_id: str | None = None
+) -> list[NativeWorkerObservationKey]:
+    """List unsettled native bindings that the service must read from Core."""
+
+    if not isinstance(condition, Mapping):
+        return []
+    if condition.get("type") == "native_worker_terminal":
+        if isinstance(condition.get("settlement"), Mapping):
+            return []
+        try:
+            task_name = _native_worker_task_name(condition.get("task_name"))
+        except ValidationError:
+            return []
+        root_id = condition.get("root_thread_id", root_thread_id)
+        if not isinstance(task_name, str) or not isinstance(root_id, str):
+            return []
+        child_id = condition.get("child_thread_id")
+        invocation_id = condition.get("invocation_id")
+        if (child_id is None) != (invocation_id is None) or (
+            child_id is not None
+            and (
+                not isinstance(child_id, str)
+                or not child_id
+                or not isinstance(invocation_id, str)
+                or not invocation_id
+            )
+        ):
+            raise ValidationError("stored native worker binding is malformed")
+        request = (
+            root_id,
+            task_name,
+            child_id if isinstance(child_id, str) else None,
+            invocation_id if isinstance(invocation_id, str) else None,
+        )
+        return [request]
+    children = condition.get("children")
+    if not isinstance(children, list):
+        return []
+    found: list[NativeWorkerObservationKey] = []
+    for child in children:
+        for item in native_worker_observation_requests(
+            child, root_thread_id=root_thread_id
+        ):
+            if item not in found:
+                found.append(item)
+    return found
+
+
+def _native_worker_task_name(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or len(value.encode("utf-8")) > 256
+        or "\0" in value
+    ):
+        raise ValidationError(
+            "native_worker_terminal.task_name must be a bounded canonical task name"
+        )
+    return value
+
+
+def _native_worker_settlement(
+    snapshot: Mapping[str, Any], *, root_thread_id: str
+) -> dict[str, Any]:
+    settlement = {
+        "task_name": snapshot["task_name"],
+        "root_thread_id": root_thread_id,
+        "child_thread_id": snapshot["child_thread_id"],
+        "invocation_id": snapshot["invocation_id"],
+        "status": snapshot["status"],
+    }
+    if snapshot.get("error") is not None:
+        settlement["error"] = snapshot["error"]
+    return settlement
+
+
+def _capture_native_worker(
+    raw: Mapping[str, Any], context: ObserverContext
+) -> dict[str, Any]:
+    task_name = _native_worker_task_name(raw.get("task_name"))
+    root_thread_id = context.native_worker_root_thread_id
+    if not isinstance(root_thread_id, str) or not root_thread_id:
+        raise ValidationError(
+            "native_worker_terminal requires trusted root-bound thread delivery"
+        )
+    snapshot = context.native_worker_observations.get(
+        (root_thread_id, task_name, None, None)
+    )
+    if not isinstance(snapshot, Mapping):
+        raise ValidationError("native worker binding is unavailable")
+    status = snapshot.get("status")
+    if status == "bindPending":
+        raise ValidationError(
+            f"native worker {task_name} has no exact invocation yet"
+        )
+    if status in {"unavailable", "mismatch"}:
+        raise ValidationError(f"native worker binding failed: {status}")
+    child_thread_id = snapshot.get("child_thread_id")
+    invocation_id = snapshot.get("invocation_id")
+    if (
+        snapshot.get("task_name") != task_name
+        or not isinstance(child_thread_id, str)
+        or not child_thread_id
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or status
+        not in {"running", "interrupted", "completed", "failed"}
+    ):
+        raise ValidationError("native worker binding returned malformed identity")
+    settlement = (
+        _native_worker_settlement(snapshot, root_thread_id=root_thread_id)
+        if status in {"interrupted", "completed", "failed"}
+        else None
+    )
+    return {
+        "type": "native_worker_terminal",
+        "task_name": task_name,
+        "root_thread_id": root_thread_id,
+        "child_thread_id": child_thread_id,
+        "invocation_id": invocation_id,
+        "armed_status": status,
+        "settlement": settlement,
+    }
+
+
 def _validate_children(raw: Mapping[str, Any], context: ObserverContext, *, monitor_id: str, receipt_token: str) -> list[dict[str, Any]]:
     children = raw.get("children")
     if not isinstance(children, list) or not children:
@@ -450,6 +581,9 @@ def prepare_condition(
     if condition_type == "thread_idle":
         _only_keys(raw, {"type", "thread_id", "accept_already_idle"}, "thread_idle")
         return _capture_thread_idle(raw, context)
+    if condition_type == "native_worker_terminal":
+        _only_keys(raw, {"type", "task_name"}, "native_worker_terminal")
+        return _capture_native_worker(raw, context)
     if condition_type == "git_ref_change":
         _only_keys(raw, {"type", "worktree", "ref"}, "git_ref_change")
         worktree = raw.get("worktree")
@@ -463,8 +597,9 @@ def prepare_condition(
         return {"type": "git_ref_change", "binding": asdict(binding)}
     raise ValidationError(
         "unsupported condition type; use time, gpu_stable, pid_exit, tmux_exit, "
-        "log_pattern, thread_idle, receipt_success, command_terminal, "
-        "worker_terminal, heartbeat_stale, git_ref_change, all, or any"
+        "log_pattern, thread_idle, native_worker_terminal, receipt_success, "
+        "command_terminal, worker_terminal, heartbeat_stale, git_ref_change, "
+        "all, or any"
     )
 
 
@@ -599,6 +734,7 @@ def _leaf(value: TriState, condition_type: str, evidence: Mapping[str, Any], *, 
         "receipt_success": "task_success",
         "log_pattern": "heuristic_log_content",
         "thread_idle": "heuristic_thread_lifecycle",
+        "native_worker_terminal": "native_worker_settlement",
     }
     rendered_evidence = dict(evidence)
     rendered_evidence.setdefault("classification", classifications.get(condition_type, "derived"))
@@ -1064,6 +1200,96 @@ def _evaluate_thread_idle(
     )
 
 
+def _evaluate_native_worker(
+    condition: MutableMapping[str, Any], context: ObserverContext
+) -> Evaluation:
+    root_thread_id = str(condition.get("root_thread_id", ""))
+    task_name = str(condition.get("task_name", ""))
+    child_thread_id = str(condition.get("child_thread_id", ""))
+    invocation_id = str(condition.get("invocation_id", ""))
+    identity = {
+        "task_name": task_name,
+        "child_thread_id": child_thread_id,
+        "invocation_id": invocation_id,
+        "task_success": False,
+        "lead_accepted": False,
+    }
+
+    settlement = condition.get("settlement")
+    if isinstance(settlement, Mapping):
+        valid = (
+            settlement.get("root_thread_id") == root_thread_id
+            and settlement.get("task_name") == task_name
+            and settlement.get("child_thread_id") == child_thread_id
+            and settlement.get("invocation_id") == invocation_id
+            and settlement.get("status") in {"interrupted", "completed", "failed"}
+        )
+        if not valid:
+            return _leaf(
+                TriState.UNKNOWN,
+                "native_worker_terminal",
+                {**identity, "kind": "mismatch"},
+                fatal=True,
+            )
+        return _leaf(
+            TriState.TRUE,
+            "native_worker_terminal",
+            {
+                **dict(settlement),
+                "kind": "native_worker_settled",
+                "task_success": False,
+                "lead_accepted": False,
+            },
+        )
+
+    snapshot = context.native_worker_observations.get(
+        (root_thread_id, task_name, child_thread_id, invocation_id)
+    )
+    status = snapshot.get("status") if isinstance(snapshot, Mapping) else "unavailable"
+    if (
+        isinstance(snapshot, Mapping)
+        and status not in {"unavailable", "mismatch"}
+        and (
+            snapshot.get("task_name") != task_name
+            or snapshot.get("child_thread_id") != child_thread_id
+            or snapshot.get("invocation_id") != invocation_id
+        )
+    ):
+        status = "mismatch"
+    if status == "running":
+        return _leaf(
+            TriState.FALSE,
+            "native_worker_terminal",
+            {**identity, "kind": "native_worker_running"},
+        )
+    if status in {"interrupted", "completed", "failed"}:
+        assert isinstance(snapshot, Mapping)
+        settlement = _native_worker_settlement(
+            snapshot, root_thread_id=root_thread_id
+        )
+        condition["settlement"] = settlement
+        return _leaf(
+            TriState.TRUE,
+            "native_worker_terminal",
+            {
+                **settlement,
+                "kind": "native_worker_settled",
+                "task_success": False,
+                "lead_accepted": False,
+            },
+        )
+    return _leaf(
+        TriState.UNKNOWN,
+        "native_worker_terminal",
+        {
+            **identity,
+            "kind": status if status in {"unavailable", "mismatch"} else "invalid_status",
+            "error": snapshot.get("error") if isinstance(snapshot, Mapping) else None,
+        },
+        fatal=True,
+    )
+
+
 def _evaluate_receipt(condition: Mapping[str, Any]) -> Evaluation:
     path = Path(str(condition["path"]))
     receipt = read_json(path)
@@ -1376,6 +1602,8 @@ def evaluate_condition(condition: MutableMapping[str, Any], context: ObserverCon
         return _evaluate_log_pattern(condition, context)
     if condition_type == "thread_idle":
         return _evaluate_thread_idle(condition, context)
+    if condition_type == "native_worker_terminal":
+        return _evaluate_native_worker(condition, context)
     if condition_type == "receipt_success":
         return _evaluate_receipt(condition)
     if condition_type == "git_ref_change":
