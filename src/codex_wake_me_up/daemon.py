@@ -26,6 +26,7 @@ from .service import MonitorService
 
 
 IDLE_GRACE_SECONDS = 60.0
+HEARTBEAT_INTERVAL_SECONDS = 2.0
 
 
 class DaemonLock(AbstractContextManager["DaemonLock"]):
@@ -149,25 +150,42 @@ async def run_daemon(
     service = MonitorService(root)
     with DaemonLock(root):
         service.recover_after_daemon_start()
-        idle_deadline: float | None = None
-        while True:
-            write_heartbeat(root)
-            await service.reconcile_once()
-            write_heartbeat(root)
-            if once:
-                return 0
-            if service.ledger.list(include_terminal=False):
-                idle_deadline = None
-            elif idle_deadline is None:
-                idle_deadline = monotonic() + IDLE_GRACE_SECONDS
-            elif monotonic() >= idle_deadline:
-                write_heartbeat(root, accepting_work=False)
-                if service.ledger.list(include_terminal=False):
+        heartbeat_stop = asyncio.Event()
+
+        async def refresh_heartbeat() -> None:
+            while True:
+                try:
+                    async with asyncio.timeout(HEARTBEAT_INTERVAL_SECONDS):
+                        await heartbeat_stop.wait()
+                except TimeoutError:
                     write_heartbeat(root)
-                    idle_deadline = None
                 else:
+                    return
+
+        heartbeat_task = asyncio.create_task(refresh_heartbeat())
+        idle_deadline: float | None = None
+        try:
+            while True:
+                write_heartbeat(root)
+                await service.reconcile_once()
+                write_heartbeat(root)
+                if once:
                     return 0
-            await sleep(interval_seconds)
+                if service.ledger.list(include_terminal=False):
+                    idle_deadline = None
+                elif idle_deadline is None:
+                    idle_deadline = monotonic() + IDLE_GRACE_SECONDS
+                elif monotonic() >= idle_deadline:
+                    write_heartbeat(root, accepting_work=False)
+                    if service.ledger.list(include_terminal=False):
+                        write_heartbeat(root)
+                        idle_deadline = None
+                    else:
+                        return 0
+                await sleep(interval_seconds)
+        finally:
+            heartbeat_stop.set()
+            await heartbeat_task
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +11,7 @@ import threading
 from codex_wake_me_up import daemon
 from codex_wake_me_up.runtime import (
     _daemon_lock_is_held,
+    daemon_delivery_capable,
     daemon_is_healthy,
     ensure_daemon_ready,
 )
@@ -147,6 +149,52 @@ def test_once_keeps_its_single_pass_behavior(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(daemon, "MonitorService", lambda _root: service)
     assert asyncio.run(daemon.run_daemon(tmp_path, interval_seconds=1, once=True)) == 0
     assert service.reconciled == 1
+
+
+def test_heartbeat_advances_while_reconciliation_awaits_io(monkeypatch, tmp_path) -> None:
+    class SlowService:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.ledger = FakeLedger(lambda: [])
+
+        def recover_after_daemon_start(self) -> None:
+            pass
+
+        async def reconcile_once(self) -> None:
+            self.started.set()
+            await self.release.wait()
+
+    service = SlowService()
+    monkeypatch.setattr(daemon, "MonitorService", lambda _root: service)
+    monkeypatch.setattr(
+        daemon, "HEARTBEAT_INTERVAL_SECONDS", 0.02, raising=False
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            daemon.run_daemon(tmp_path, interval_seconds=1.0)
+        )
+        try:
+            await asyncio.wait_for(service.started.wait(), timeout=1.0)
+            first = json.loads(
+                (tmp_path / "daemon-heartbeat.json").read_text()
+            )["at"]
+            await asyncio.sleep(0.08)
+            second = json.loads(
+                (tmp_path / "daemon-heartbeat.json").read_text()
+            )["at"]
+            assert second > first
+            assert daemon_delivery_capable(tmp_path, max_age_seconds=0.1)
+        finally:
+            service.release.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
 
 
 def test_retiring_lock_allows_exactly_one_replacement_for_concurrent_callers(

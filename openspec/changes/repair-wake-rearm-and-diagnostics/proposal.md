@@ -25,10 +25,17 @@ host-observed terminal status rather than approximation.
   on HOLD rather than approximating completion from thread idleness, disappearance,
   or cooperative publish.
 - Keep any/all composition and root queue delivery unchanged.
+- Keep the daemon heartbeat fresh while its event loop awaits reconciliation I/O;
+  long serial read passes must not make a live lock owner spuriously unready.
 
-This change does not weaken one-trigger, one-admission, or fail-closed rules. It
-authorizes no runtime install, daemon restart, live monitor, Core mutation, model
-continuation, or other material spend.
+This change does not weaken one-trigger, one-admission, or fail-closed rules.
+The initial source-only authorization excluded runtime installation and live
+continuation. On 2026-09-08 the user explicitly authorized overcoming both observed
+runtime blockers and installing the result locally. This continuation includes
+the matching Core/plugin build and installation, coordinated daemon/Core
+activation, and bounded real native-worker wake acceptance under task 4.3.
+Unrelated active tasks, native state, monitor records, and rollback paths must be
+preserved; source or build success alone is not installed-runtime acceptance.
 
 ## Capabilities
 

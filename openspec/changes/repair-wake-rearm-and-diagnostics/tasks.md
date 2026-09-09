@@ -55,3 +55,11 @@
 - [x] 5.4 Replay the full plugin suite, Ruff, compileall, skill validation, strict
   OpenSpec validation, and owned-path whitespace checks. Keep installed runtime and
   the already terminal historical row unchanged.
+
+## 6. Installed daemon heartbeat repair
+
+- [x] 6.1 Reproduce heartbeat staleness while reconciliation awaits I/O; maintain
+  heartbeat independently of the full pass without changing readiness deadlines,
+  retirement, admission, or recovery semantics. Replay residency and plugin checks.
+- [x] 6.2 Install the accepted plugin and replace only the validated daemon lock
+  owner; verify fresh installed-source heartbeat and preserved monitor/event state.

@@ -138,3 +138,21 @@ use existing reconciliation instead.
 - **WHEN** transport becomes uncertain only after `admission_attempted_at` is set
 - **THEN** the system reconciles the consumed admission and never issues a second
   queue-add
+
+### Requirement: Maintain supervision during awaited reconciliation
+
+The lock-owning daemon SHALL refresh its heartbeat while its event loop awaits
+reconciliation I/O, without extending the existing readiness age limit or changing
+monitor admission, retry, and settlement behavior. Its heartbeat task SHALL stop
+before the daemon releases the lock and MUST NOT overwrite the final retiring
+state. A fresh heartbeat SHALL establish supervision only, not task success.
+
+#### Scenario: Reconciliation awaits a slow app-server request
+- **WHEN** a healthy lock-owning daemon is awaiting reconciliation I/O longer than
+  the readiness heartbeat limit while its event loop remains responsive
+- **THEN** the heartbeat advances within that limit and registration does not
+  reject solely because the full reconciliation pass has not finished
+
+#### Scenario: Idle daemon retires
+- **WHEN** the daemon records that it is no longer accepting work and exits
+- **THEN** no background heartbeat restores accepting-work before lock release

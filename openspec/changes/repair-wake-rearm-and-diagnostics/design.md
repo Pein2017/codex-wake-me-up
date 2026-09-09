@@ -121,6 +121,22 @@ reconciliation applies and queue-add is never retried.
 
 ## Risks / Trade-offs
 
+### Runtime continuation: heartbeat during awaited reconciliation
+
+The September 8 installed daemon retained its process and lock while serial
+app-server requests delayed the heartbeat beyond the 15-second readiness bound.
+`run_daemon` now owns one event-loop heartbeat task with a 2-second interval for
+the duration of its reconciliation loop. It stops that task before releasing the
+daemon lock. Retirement still writes `accepting_work=false`, and no asynchronous
+gap permits a later heartbeat to overwrite that final state. This changes neither
+the readiness threshold nor admission/retry behavior. A blocked event loop still
+becomes stale; a heartbeat proves supervision, not monitor completion.
+
+Receipt: a regression holds reconciliation in an awaited I/O boundary and verifies
+the on-disk heartbeat advances and the actual readiness predicate remains true.
+The pre-change implementation fails that check; the candidate passes it together
+with existing residency, retirement, and single-pass checks.
+
 - [A readiness reason can change immediately after rejection] -> Label it as the
   current post-failure diagnosis, not the historical cause.
 - [Lineage may precede final history recording] -> Preserve the parent's live state
@@ -134,3 +150,13 @@ No persistence migration is needed. In particular, an already terminal historica
 delivery-loss row is not reopened or requeued automatically. Source verification
 does not activate the installed plugin. Installation, daemon restart, Core changes,
 and real native root-final wake remain separate user-authorized acceptance steps.
+
+The user supplied that authorization on 2026-09-08 after live registration exposed
+`thread/agent/observe` as unsupported and daemon readiness as `stale_heartbeat`.
+Continue task 4.3 against the existing contract. Build and verify compatible
+versioned candidates before activation; coordinate the shared Core switch after
+workers settle and retain exact prior executable/package identities for rollback.
+Investigate the stale daemon cause before deciding whether source repair or an
+operational replacement is needed. Do not weaken readiness or use thread idleness
+as a substitute for native settlement. Record source, installation, and actual
+root-final wake evidence separately in verification.md.
