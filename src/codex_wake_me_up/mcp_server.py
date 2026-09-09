@@ -14,13 +14,11 @@ from .service import MonitorService
 mcp = FastMCP(
     "Codex Wake Me Up",
     instructions=(
-        "Use wait_for_event as the primary one-shot, host-local monitor for an "
-        "exact task regardless of goal state; do not create a goal. After an "
-        "armed receipt, end the current turn. A terminal reservation returns a "
-        "monitor_condition to arm after its existing launcher starts the producer. "
-        "Choose defer_goal_until_event only "
-        "for explicit legacy goal pause/reactivation. A queued wake is billed and "
-        "is not a success claim; inspect durable status once after delivery."
+        "Use wait_for_event for ordinary waits bound to the trusted current task; "
+        "never create a goal or launch its producer. End only after state=armed. "
+        "Delivery is billed, not exactly-once, and not task success; then read "
+        "wake_me_up_status once. Use defer_goal_until_event only for explicit "
+        "legacy goal pause/reactivation."
     ),
 )
 _service: MonitorService | None = None
@@ -36,11 +34,9 @@ def service() -> MonitorService:
 @mcp.tool(
     name="wait_for_event",
     description=(
-        "Primary path: durably monitor one typed condition for one exact local "
-        "Codex task, regardless of goal state. A fired monitor queues one small "
-        "self-identifying pointer; queue delivery is billed and not exactly-once. "
-        "This asynchronously arms and returns immediately; it never launches or "
-        "joins a producer. After an armed receipt, end the current turn."
+        "Arm one durable monitor for the trusted current task and return immediately; "
+        "never launch or join its producer. End the turn only after state=armed. "
+        "Delivery is billed, not exactly-once, and not task success."
     ),
 )
 async def wait_for_event(
@@ -72,8 +68,8 @@ async def wait_for_event(
 @mcp.tool(
     name="defer_goal_until_event",
     description=(
-        "Optional legacy GoalDelivery path for an explicitly selected active or "
-        "paused goal. It never creates a goal and never falls back to thread delivery."
+        "Legacy only: pause/reactivate an explicitly selected active or paused goal; "
+        "never create a goal or fall back to thread delivery."
     ),
 )
 async def defer_goal_until_event(
@@ -97,11 +93,8 @@ async def defer_goal_until_event(
 @mcp.tool(
     name="wake_me_up",
     description=(
-        "Arm one typed, durable local monitor for a loaded paused Codex goal. "
-        "If no unfinished goal exists, do not call create_goal or retry this tool. "
-        "Use allow_heuristic_continuation only when time/GPU/PID/tmux/log/thread "
-        "evidence is intentionally sufficient to continue the goal. Pass rearm_of "
-        "to record lineage from the terminal monitor this one succeeds."
+        "Legacy goal-only arm for an already paused goal; never create a missing goal "
+        "or retry. Heuristic continuation must be explicit; rearm_of records lineage."
     ),
 )
 async def wake_me_up(
@@ -125,13 +118,10 @@ async def wake_me_up(
 @mcp.tool(
     name="wake_me_up_defer",
     description=(
-        "Best-effort pause and arm one typed monitor for an explicitly supplied "
-        "loaded active goal. The supplied thread ID is not authenticated as the "
-        "caller's current task. The watcher must be positively ready before pause; "
-        "if no unfinished goal exists, do not call create_goal or retry this tool. "
-        "After an armed receipt, end the current turn immediately without sleeping "
-        "or polling. This tool cannot mechanically end a running turn. Expiry itself "
-        "wakes a deferred goal; pass rearm_of to record lineage from a fired monitor."
+        "Legacy only: best-effort pause and arm an explicitly selected active goal; "
+        "its thread ID is unauthenticated. Require a ready watcher, never create or "
+        "retry a missing goal, and end only after state=armed. Expiry wakes the goal; "
+        "rearm_of records lineage."
     ),
 )
 async def wake_me_up_defer(
@@ -155,8 +145,8 @@ async def wake_me_up_defer(
 @mcp.tool(
     name="wake_me_up_status",
     description=(
-        "Read one monitor once after a wake. The default decision view is the "
-        "compact self-describing wake report; audit returns the full forensic status."
+        "Read one monitor after a wake. decision is compact and default; audit is "
+        "the full forensic status."
     ),
 )
 def wake_me_up_status(
@@ -188,9 +178,9 @@ def wake_me_up_publish_receipt(monitor_id: str, token: str, status: str) -> dict
 @mcp.tool(
     name="wake_me_up_event_reserve",
     description=(
-        "Reserve one command/worker terminal event from a private mode-0600 JSON "
-        "payload. The raw publish token is returned only on first creation; the "
-        "non-secret monitor_condition is returned for a separate asynchronous arm."
+        "Reserve a command/worker terminal event from a private mode-0600 JSON file. "
+        "Return a raw token only on creation and a non-secret monitor_condition to "
+        "arm separately."
     ),
 )
 def wake_me_up_event_reserve(payload_path: str) -> dict[str, Any]:
@@ -218,8 +208,8 @@ def wake_me_up_event_cancel(reservation_id: str) -> dict[str, Any]:
 @mcp.tool(
     name="wake_me_up_event_heartbeat",
     description=(
-        "Publish one bounded producer heartbeat from a private mode-0600 JSON "
-        "payload; token text is never an MCP argument."
+        "Publish a bounded producer heartbeat from a private mode-0600 JSON file; "
+        "the token is never an MCP argument."
     ),
 )
 def wake_me_up_event_heartbeat(payload_path: str) -> dict[str, Any]:
@@ -234,8 +224,8 @@ def wake_me_up_event_heartbeat(payload_path: str) -> dict[str, Any]:
 @mcp.tool(
     name="wake_me_up_event_publish",
     description=(
-        "Publish the immutable command/worker terminal envelope from a private "
-        "mode-0600 JSON payload; this is handling evidence, never acceptance."
+        "Publish an immutable command/worker terminal event from a private mode-0600 "
+        "JSON file; it is evidence, never acceptance."
     ),
 )
 def wake_me_up_event_publish(payload_path: str) -> dict[str, Any]:
