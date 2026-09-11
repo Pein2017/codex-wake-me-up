@@ -12,7 +12,7 @@ context: |
     are read-only accounts of what was true when they were written.
   - src/codex_wake_me_up/ is the implementation; skills/wake-me-up/SKILL.md is
     the packaged agent-facing guidance; README.md is the operator surface.
-  - The parent repository's openspec root owns CoordExp-Swift and is unrelated
+  - The parent repository's openspec root owns coordexp-infras and is unrelated
     to this module.
 
   Standing invariants. A change must preserve these or explicitly renegotiate

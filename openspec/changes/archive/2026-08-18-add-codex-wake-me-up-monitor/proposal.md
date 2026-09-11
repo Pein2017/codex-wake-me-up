@@ -64,4 +64,4 @@ the target identity, and the once-only outcome durable and inspectable.
   the active desktop session, or alter existing sessions during normal tests.
 - Introduces a new optional local process for operators who arm monitors. It
   does not require GPUs, change model/data behavior, or alter existing
-  CoordExp-Swift compatibility contracts.
+  coordexp-infras compatibility contracts.
