@@ -3,7 +3,9 @@
 ## Purpose
 Provide host-local, durable monitoring of explicit external conditions with
 thread-primary queue delivery and optional guarded delivery to an existing goal.
+
 ## Requirements
+
 ### Requirement: Register a typed, one-shot monitor
 
 The system SHALL let an operator register one monitor with one exact local
@@ -308,11 +310,13 @@ whole-task success.
 ### Requirement: Observe a reserved worker-terminal event
 
 The system SHALL support a `worker_terminal` condition leaf naming one bound
-worker reservation. The leaf SHALL become true for `delivered`, `blocked`,
-`failed`, and `cancelled` outcomes. Its witness SHALL carry the producer
-identity, declared outcome, and, for a delivery, the candidate commit and
-bounded Git attestation. Worker termination and delivery SHALL remain candidate
-evidence and MUST NOT be represented as lead acceptance.
+worker reservation. The leaf SHALL become true for `delivered`, `completed`,
+`blocked`, `failed`, `cancelled`, and `settlement_uncertain` outcomes. Its
+witness SHALL carry the producer identity and declared outcome and, only for a
+delivery, the candidate commit and bounded Git attestation. Worker completion,
+termination, uncertain settlement, and delivery SHALL remain candidate,
+lifecycle, or failure evidence and MUST NOT be represented as lead acceptance
+or task success.
 
 #### Scenario: Worker delivers a valid candidate
 - **WHEN** the bound worker event is `delivered` and Git attestation is valid
@@ -325,10 +329,16 @@ evidence and MUST NOT be represented as lead acceptance.
 - **THEN** the leaf still becomes true with an invalid-delivery witness so the
   lead can handle it instead of remaining asleep
 
+#### Scenario: Worker completes without a commit
+- **WHEN** the bound worker publishes `completed`
+- **THEN** the leaf becomes true with lifecycle evidence, no candidate review
+  target, and explicit false task-success and lead-acceptance flags
+
 #### Scenario: Worker ends without a commit
-- **WHEN** the bound worker publishes `blocked`, `failed`, or `cancelled`
+- **WHEN** the bound worker publishes `blocked`, `failed`, `cancelled`, or
+  `settlement_uncertain`
 - **THEN** the leaf becomes true with its bounded reason and no invented review
-  target
+  target, task success, or lead acceptance
 
 ### Requirement: Observe a stale producer heartbeat
 
