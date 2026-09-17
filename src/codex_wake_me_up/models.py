@@ -138,6 +138,7 @@ class PreArmRegistrationError(AppServerError):
         safe_to_retry: bool,
         retry_attempted: bool,
         required_capability: str | None = None,
+        budget_seconds: float | None = None,
     ) -> None:
         self.stage = stage
         self.error_kind = error_kind
@@ -146,6 +147,7 @@ class PreArmRegistrationError(AppServerError):
         self.retry_attempted = retry_attempted
         self.monitor_created = False
         self.required_capability = required_capability
+        self.budget_seconds = budget_seconds
         super().__init__(
             "thread delivery registration failed: "
             f"stage={stage} error_kind={error_kind} error={error}"
@@ -162,6 +164,8 @@ class PreArmRegistrationError(AppServerError):
         }
         if self.required_capability is not None:
             result["required_capability"] = self.required_capability
+        if self.budget_seconds is not None:
+            result["budget_seconds"] = self.budget_seconds
         return result
 
 

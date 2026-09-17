@@ -127,8 +127,18 @@ task success or acceptance.
   may already be `queue_accepted`, but remains nonterminal and is never resent.
   Nothing re-arms itself.
 - `wake_me_up_current_monitors` lists only monitors whose frozen delivery target
-  is the trusted current task. A target's `wake_me_up_status` read is recorded
-  as delivery-consumption evidence, not as proof it understood or accepted work.
+  is the trusted current task, with compact condition, delivery, supervision,
+  and lifecycle facts for admitted or unresolved work. A target's
+  `wake_me_up_status` read is recorded as delivery-consumption evidence, not as
+  proof it understood or accepted work.
+- An armed receipt's expiry is an observation deadline, not a delivery deadline.
+  Treat notification recording, target-status consumption, task completion, and
+  lead acceptance as separate facts. If registration times out before arming,
+  the typed rowless result names the failed app-server read stage and whether a
+  retry is safe; target resolution and condition observations share a
+  25-second budget. Bounded synchronous identity capture has a final rowless
+  deadline gate but is not an interruptible MCP wall-clock guarantee. Do not
+  retry after a queue admission has begun.
 - Use one composed `all` monitor to wake after every worker settles. For
   continuing first-settlement control, arm independent single-leaf monitors;
   retain or cancel survivors explicitly. Typed `any` consumes losers.

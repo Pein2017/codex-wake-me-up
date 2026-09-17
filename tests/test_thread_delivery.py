@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+import codex_wake_me_up.service as service_module
 from codex_wake_me_up.app_server import AppServerClient
 from codex_wake_me_up.conditions import ObserverContext
 from codex_wake_me_up.delivery import (
@@ -305,6 +306,54 @@ def test_thread_delivery_retries_one_typed_prearm_transport_failure(tmp_path) ->
     assert len(service.ledger.list()) == 1
 
 
+def test_thread_delivery_app_server_read_budget_is_shared_and_rowless(
+    tmp_path, monkeypatch
+) -> None:
+    class SlowDelivery(FakeThreadDelivery):
+        async def resolve_thread_delivery(self, thread_id: str) -> dict:
+            await asyncio.sleep(0.02)
+            return await super().resolve_thread_delivery(thread_id)
+
+    class SlowObserver(FakeAppServer):
+        async def read_observation(self, thread_id: str, *, include_goal: bool = True):
+            await asyncio.sleep(0.02)
+            return await super().read_observation(
+                thread_id, include_goal=include_goal
+            )
+
+    monkeypatch.setattr(service_module, "PREARM_REGISTRATION_BUDGET_SECONDS", 0.03)
+    delivery = SlowDelivery()
+    service = _thread_service(
+        tmp_path,
+        delivery,
+        Clock(),
+        observer_adapter=SlowObserver(
+            [], thread_observations={"child": observation(thread_id="child")}
+        ),
+    )
+
+    with pytest.raises(AppServerError) as caught:
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="thread-1",
+                condition={"type": "thread_idle", "thread_id": "child"},
+                expires_in_seconds=100,
+                idempotency_key="shared-prearm-budget",
+                start_daemon=False,
+            )
+        )
+
+    error = caught.value
+    assert getattr(error, "error_kind", None) == "timeout"
+    assert getattr(error, "stage", None) == "prepare_condition"
+    assert getattr(error, "budget_seconds", None) == 0.03
+    assert getattr(error, "safe_to_retry", None) is True
+    assert getattr(error, "retry_attempted", None) is False
+    assert error.as_dict()["budget_seconds"] == 0.03
+    assert service.ledger.list() == []
+    assert delivery.add_calls == []
+
+
 def test_target_status_observation_is_not_acceptance_and_list_is_scoped(tmp_path) -> None:
     clock = Clock()
     service = _thread_service(tmp_path, FakeThreadDelivery(), clock)
@@ -331,9 +380,15 @@ def test_target_status_observation_is_not_acceptance_and_list_is_scoped(tmp_path
     assert decision["delivery"]["target_status_observed_at"] == clock.value
     assert decision.get("lead_accepted") is not True
     assert decision.get("task_success") is not True
-    assert [item["monitor_id"] for item in service.list_for_target("thread-1")] == [
-        receipt["monitor_id"]
-    ]
+    listed = service.list_for_target("thread-1")
+    assert [item["monitor_id"] for item in listed] == [receipt["monitor_id"]]
+    assert listed[0]["condition"]["type"] == "time"
+    assert listed[0]["delivery"]["state"] == ThreadDeliveryState.QUEUE_ACCEPTED
+    assert listed[0]["delivery"]["classification"] == "queued"
+    assert listed[0]["delivery"]["queue_receipt"]["item_id"] == "queue-1"
+    assert listed[0]["supervision"] in {"healthy", "unsupervised"}
+    assert listed[0]["created_at"] <= listed[0]["updated_at"]
+    assert listed[0]["expires_at"] == 200.0
     assert service.list_for_target("another-thread") == []
 
 
@@ -1157,8 +1212,9 @@ def test_wait_for_event_arms_exact_thread_without_reading_or_mutating_a_goal(
     assert result["state"] == MonitorState.ARMED
     assert result["delivery"]["kind"] == DeliveryKind.THREAD
     assert result["delivery"]["target_thread_id"] == "thread-1"
-    assert result["next_action"].startswith("end turn; time -> thread-1")
-    assert result["next_action"].endswith("not acceptance")
+    assert result["next_action"].startswith("end turn; wait for time")
+    assert "observation expires" in result["next_action"]
+    assert result["next_action"].endswith("separate")
     assert result["targeting"]["authenticated_current_task"] is False
     assert adapter.preflight_calls == ["thread-1"]
     assert adapter.add_calls == []

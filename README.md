@@ -121,21 +121,29 @@ and Core boundary. Check it before using `native_worker_terminal`: an
 catalogue, and an `indeterminate` result names the bounded transport/probe
 reason. Neither result creates a monitor or silently falls back to
 `thread_idle`. `wake_me_up_current_monitors` returns only monitors frozen to the
-trusted current task. A trusted target's status read is recorded separately from
-condition, queue recording, and task acceptance.
+trusted current task, including compact condition, delivery, supervision, and
+lifecycle facts for admitted or stale rows. A trusted target's status read is
+recorded separately from condition, queue recording, and task acceptance.
 
 Registration also has a dedicated compact projection: an armed receipt contains
 only monitor/idempotency identity, state, compact condition binding, expiry,
 origin and root delivery target, delivery kind, supervision, targeting, next
-action, and any required receipt instructions. Full capability, empty evidence,
-witness, outcome, and reconciliation fields remain in durable audit status, not
-the ordinary model response.
+action, and any required receipt instructions. Its expiry is the observation
+deadline only: notification recording, target-status consumption, task
+completion, and lead acceptance remain separate facts. Full capability, empty
+evidence, witness, outcome, and reconciliation fields remain in durable audit
+status, not the ordinary model response.
 
 If target resolution or condition preparation fails before monitor creation,
 `wait_for_event` returns `state=not_created`, `monitor_created=false`, a stable
-stage, a compact error class, and retry safety. It performs at most one retry for
-a typed read-only local transport failure before any ledger row or queue
-admission; it never reuses this rule after a durable delivery attempt.
+stage, a compact error class, and retry safety. A single documented 25-second
+app-server read budget covers target resolution and condition observations; a
+timeout names the read stage and budget while remaining rowless and safe to
+retry. Bounded synchronous identity capture retains a final rowless deadline
+gate but is not an interruptible MCP wall-clock guarantee. The path performs at
+most one retry for a typed read-only local transport failure before any ledger
+row or queue admission; it never reuses this rule after a durable delivery
+attempt.
 
 The MCP request timeout is only a control-call bound. Once registration returns
 an `armed` durable receipt, the detached daemon owns observation and delivery

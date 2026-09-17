@@ -507,8 +507,11 @@ def test_source_prompt_return_detaches_observation_and_cancels_before_delivery(
         )
     )
     assert prompt_receipt["state"] == MonitorState.ARMED
-    assert prompt_receipt["next_action"].startswith("end turn; time -> thread-1")
-    assert prompt_receipt["next_action"].endswith("not acceptance")
+    assert prompt_receipt["next_action"].startswith(
+        "end turn; wait for time"
+    )
+    assert "observation expires" in prompt_receipt["next_action"]
+    assert prompt_receipt["next_action"].endswith("separate")
     assert daemon_starts == [str(tmp_path)]
 
     detached = MonitorService(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import secrets
@@ -77,6 +78,8 @@ ObserverContextFactory = Callable[[], ObserverContext]
 
 # The repo's long-poll yield floor: what one avoided polling turn would cost.
 POLL_YIELD_FLOOR_SECONDS = 180.0
+# Keep serial target and condition reads inside the MCP request budget.
+PREARM_REGISTRATION_BUDGET_SECONDS = 25.0
 WAKE_JOURNAL_TAIL_LINES = 20
 DECISION_JOURNAL_TAIL_RUNS = 8
 MAX_REARM_CHAIN = 20
@@ -404,7 +407,10 @@ class MonitorService:
 
     @staticmethod
     def _prearm_error(
-        stage: str, error: AppServerError, *, retry_attempted: bool
+        stage: str,
+        error: AppServerError,
+        *,
+        retry_attempted: bool,
     ) -> PreArmRegistrationError:
         required_capability = (
             error.method
@@ -432,29 +438,64 @@ class MonitorService:
             required_capability=required_capability,
         )
 
+    @staticmethod
+    def _prearm_timeout(
+        stage: str, *, retry_attempted: bool, budget_seconds: float
+    ) -> PreArmRegistrationError:
+        return PreArmRegistrationError(
+            stage=stage,
+            error_kind="timeout",
+            error="pre-arm registration budget expired",
+            safe_to_retry=True,
+            retry_attempted=retry_attempted,
+            budget_seconds=budget_seconds,
+        )
+
     async def _prearm_read(
         self,
         stage: str,
         factory: AppServerFactory,
         operation: Callable[[Any], Any],
+        *,
+        deadline: float,
+        budget_seconds: float,
+        retry_state: MutableMapping[str, bool] | None = None,
     ) -> Any:
         """Run one read-only registration observation with at most one retry."""
 
-        retry_attempted = False
+        retry_attempted = bool(retry_state and retry_state.get("attempted"))
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._prearm_timeout(
+                    stage,
+                    retry_attempted=retry_attempted,
+                    budget_seconds=budget_seconds,
+                )
             try:
-                async with factory() as app_server:
-                    return await operation(app_server)
+                async with asyncio.timeout(remaining):
+                    async with factory() as app_server:
+                        return await operation(app_server)
+            except asyncio.TimeoutError as exc:
+                raise self._prearm_timeout(
+                    stage,
+                    retry_attempted=retry_attempted,
+                    budget_seconds=budget_seconds,
+                ) from exc
             except AppServerTransportError as exc:
                 if not retry_attempted:
                     retry_attempted = True
+                    if retry_state is not None:
+                        retry_state["attempted"] = True
                     continue
                 raise self._prearm_error(
                     stage, exc, retry_attempted=True
                 ) from exc
             except AppServerError as exc:
                 raise self._prearm_error(
-                    stage, exc, retry_attempted=retry_attempted
+                    stage,
+                    exc,
+                    retry_attempted=retry_attempted,
                 ) from exc
 
     async def runtime_capabilities(self) -> dict[str, Any]:
@@ -555,10 +596,16 @@ class MonitorService:
             raise ValidationError(
                 "event monitor requires an exact event-capable daemon before arming"
             )
+        prearm_budget = PREARM_REGISTRATION_BUDGET_SECONDS
+        prearm_deadline = time.monotonic() + prearm_budget
+        retry_state: dict[str, bool] = {}
         capability = await self._prearm_read(
             "resolve_delivery_target",
             self.thread_delivery_factory,
             lambda app_server: app_server.resolve_thread_delivery(thread_id),
+            deadline=prearm_deadline,
+            budget_seconds=prearm_budget,
+            retry_state=retry_state,
         )
         if capability.get("origin_thread_id") != thread_id:
             raise ValidationError("thread delivery resolved a different origin")
@@ -606,7 +653,20 @@ class MonitorService:
                 )
             )
 
-        await self._prearm_read("prepare_condition", self.app_server_factory, prepare)
+        await self._prearm_read(
+            "prepare_condition",
+            self.app_server_factory,
+            prepare,
+            deadline=prearm_deadline,
+            budget_seconds=prearm_budget,
+            retry_state=retry_state,
+        )
+        if time.monotonic() >= prearm_deadline:
+            raise self._prearm_timeout(
+                "prepare_condition",
+                retry_attempted=retry_state.get("attempted", False),
+                budget_seconds=prearm_budget,
+            )
         receipt_token = secrets.token_urlsafe(32)
         prepared_condition = prepare_condition(
             condition,
@@ -615,6 +675,12 @@ class MonitorService:
             receipt_token=receipt_token,
         )
         prepared_event_bindings = event_condition_bindings(prepared_condition)
+        if time.monotonic() >= prearm_deadline:
+            raise self._prearm_timeout(
+                "prepare_condition",
+                retry_attempted=retry_state.get("attempted", False),
+                budget_seconds=prearm_budget,
+            )
         record, _created = self.ledger.create_or_get(
             monitor_id=monitor_id,
             idempotency_key=idempotency_key,
@@ -1466,8 +1532,9 @@ class MonitorService:
             }
         if record.state == MonitorState.ARMED:
             response["next_action"] = (
-                f"end turn; {_condition_binding_summary(record.condition)['type']} -> "
-                f"{target_thread_id} by {record.expires_at:.0f}; not acceptance"
+                f"end turn; wait for "
+                f"{_condition_binding_summary(record.condition)['type']}; "
+                f"observation expires {record.expires_at:.0f}; separate"
             )
         elif record.outcome:
             response["outcome"] = dict(record.outcome)
@@ -1703,9 +1770,118 @@ class MonitorService:
     def list(self) -> list[dict[str, Any]]:
         return [self.decision_status(record.monitor_id) for record in self.ledger.list()]
 
+    @staticmethod
+    def _current_monitor_delivery(record: MonitorRecord) -> dict[str, Any]:
+        source = record.delivery or {}
+        delivery: dict[str, Any] = {
+            "kind": record.delivery_kind.value,
+            "state": record.delivery_state or record.state.value,
+        }
+        if record.delivery_kind == DeliveryKind.THREAD:
+            for key in ("delivery_id", "origin_thread_id", "thread_id"):
+                if source.get(key) is not None:
+                    delivery[
+                        "target_thread_id" if key == "thread_id" else key
+                    ] = source[key]
+        elif record.target is not None:
+            delivery["target_thread_id"] = record.target.thread_id
+
+        outcome = (
+            record.delivery_outcome
+            if isinstance(record.delivery_outcome, Mapping)
+            else {}
+        )
+        reconciliation = (
+            record.reconciliation
+            if isinstance(record.reconciliation, Mapping)
+            else {}
+        )
+        classification = outcome.get("kind") or reconciliation.get("classification")
+        if classification is not None:
+            delivery["classification"] = classification
+        for key in (
+            "absence_kind",
+            "observed_pointer_count",
+            "stall",
+            "online_absence_seconds",
+            "error",
+        ):
+            value = outcome.get(key)
+            if value is None:
+                value = reconciliation.get(key)
+            if value is not None:
+                delivery[key] = str(value)[:512] if key == "error" else value
+        if isinstance(record.queue_receipt, Mapping):
+            queue_receipt = {
+                key: record.queue_receipt.get(key)
+                for key in ("item_id", "client_user_message_id")
+                if record.queue_receipt.get(key) is not None
+            }
+            if queue_receipt:
+                delivery["queue_receipt"] = queue_receipt
+        if reconciliation:
+            for key in (
+                "at",
+                "last_online_at",
+                "resume_attempted_at",
+                "deletion_attempted_at",
+            ):
+                if reconciliation.get(key) is not None:
+                    delivery[key] = reconciliation[key]
+            compact_reconciliation = {
+                key: reconciliation.get(key)
+                for key in (
+                    "classification",
+                    "runtime_status",
+                    "interrupted",
+                    "history_matches",
+                    "queue_matches",
+                    "observed_pointer_count",
+                    "absence_kind",
+                    "stall",
+                    "pre_resume_item_count",
+                    "resume_attempted_at",
+                    "deletion_attempted_at",
+                )
+                if reconciliation.get(key) is not None
+            }
+            if compact_reconciliation:
+                delivery["reconciliation"] = compact_reconciliation
+        if record.target_status_observed_at is not None:
+            delivery["target_status_observed_at"] = record.target_status_observed_at
+        return delivery
+
+    def _current_monitor_summary(self, record: MonitorRecord) -> dict[str, Any]:
+        """Return bounded facts for monitors targeting the trusted current task."""
+
+        value: dict[str, Any] = {
+            "monitor_id": record.monitor_id,
+            "idempotency_key": record.idempotency_key,
+            "state": record.state.value,
+            "condition": _condition_binding_summary(record.condition),
+            "delivery": self._current_monitor_delivery(record),
+            "supervision": (
+                "not_required"
+                if is_terminal(record.state)
+                else "healthy" if daemon_is_healthy(self.root) else "unsupervised"
+            ),
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "expires_at": record.expires_at,
+        }
+        for key in (
+            "armed_at",
+            "admission_attempted_at",
+            "target_status_observed_at",
+        ):
+            timestamp = getattr(record, key)
+            if timestamp is not None:
+                value[key] = timestamp
+        return value
+
     def list_for_target(self, target_thread_id: str) -> list[dict[str, Any]]:
         return [
-            self.decision_status(record.monitor_id)
+            self._current_monitor_summary(record)
             for record in self.ledger.list()
             if record.delivery_kind is DeliveryKind.THREAD
             and (record.delivery or {}).get("thread_id") == target_thread_id

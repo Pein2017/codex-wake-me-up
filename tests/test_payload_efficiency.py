@@ -63,8 +63,9 @@ def test_compact_arm_receipt_is_at_least_58_percent_smaller_with_summary(tmp_pat
         "origin_thread_id": "thread-1",
         "target_thread_id": "thread-1",
     }
-    assert receipt["next_action"].startswith("end turn; any -> thread-1")
-    assert receipt["next_action"].endswith("not acceptance")
+    assert receipt["next_action"].startswith("end turn; wait for any")
+    assert "observation expires" in receipt["next_action"]
+    assert receipt["next_action"].endswith("separate")
     assert "capability" not in receipt["delivery"]
     assert "outcome" not in receipt
     assert len(receipt) <= 10

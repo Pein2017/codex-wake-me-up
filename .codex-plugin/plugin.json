@@ -1,6 +1,6 @@
 {
   "name": "codex-wake-me-up",
-  "version": "0.1.0+codex.20260909065612",
+  "version": "0.1.0+codex.20260917081434",
   "description": "Host-local durable event monitors that wake the current root Codex task.",
   "author": {
     "name": "CoordExp"
