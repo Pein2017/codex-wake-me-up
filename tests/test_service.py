@@ -1485,8 +1485,10 @@ def test_thread_idle_defers_until_the_child_thread_ends_its_turn(tmp_path) -> No
     assert status["outcome"]["wake_reason"] == "condition"
     assert [item["type"] for item in witness] == ["thread_idle"]
     assert witness[0]["evidence"]["child"]["runtime_status"] == "idle"
-    assert witness[0]["evidence"]["child"]["usage"]["token_budget"] == 32
+    assert "goal_status" not in witness[0]["evidence"]["child"]
+    assert "usage" not in witness[0]["evidence"]["child"]
     assert fake.child_reads.count("child-thread") == 3
+    assert fake.child_read_include_goal == [False, False, False]
 
 
 def test_thread_idle_is_rejected_when_it_names_the_monitors_own_target(tmp_path) -> None:

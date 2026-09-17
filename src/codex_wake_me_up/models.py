@@ -118,6 +118,53 @@ class AppServerRejectedError(AppServerError):
     """The app-server conclusively rejected a validly transported request."""
 
 
+class AppServerUnsupportedMethodError(AppServerRejectedError):
+    """A required app-server method is absent from this installed Core."""
+
+    def __init__(self, method: str):
+        self.method = method
+        super().__init__(f"app-server does not support required method: {method}")
+
+
+class PreArmRegistrationError(AppServerError):
+    """A pre-arm registration failure with no durable monitor side effect."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        error_kind: str,
+        error: str,
+        safe_to_retry: bool,
+        retry_attempted: bool,
+        required_capability: str | None = None,
+    ) -> None:
+        self.stage = stage
+        self.error_kind = error_kind
+        self.error = error
+        self.safe_to_retry = safe_to_retry
+        self.retry_attempted = retry_attempted
+        self.monitor_created = False
+        self.required_capability = required_capability
+        super().__init__(
+            "thread delivery registration failed: "
+            f"stage={stage} error_kind={error_kind} error={error}"
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "state": "not_created",
+            "monitor_created": False,
+            "stage": self.stage,
+            "error": {"kind": self.error_kind, "message": self.error},
+            "safe_to_retry": self.safe_to_retry,
+            "retry_attempted": self.retry_attempted,
+        }
+        if self.required_capability is not None:
+            result["required_capability"] = self.required_capability
+        return result
+
+
 @dataclass(frozen=True)
 class GoalMarker:
     """The strongest paused-goal identity currently exposed by app-server."""

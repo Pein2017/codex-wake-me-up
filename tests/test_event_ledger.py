@@ -396,6 +396,39 @@ def test_settlement_uncertain_round_trips_through_durable_reservation(tmp_path) 
     assert reopened.get_event("worker-event").status_dict() == published.status_dict()
 
 
+def test_worker_declared_references_round_trip_without_acceptance(tmp_path) -> None:
+    ledger = Ledger(tmp_path)
+    ledger.reserve_event(
+        reservation_id="worker-references",
+        idempotency_key=None,
+        kind="worker_terminal",
+        producer_id="worker-1",
+        semantic={},
+        publish_token="secret-token",
+        expires_at=200.0,
+        now=100.0,
+    )
+
+    published = ledger.publish_terminal_event(
+        "worker-references",
+        publish_token="secret-token",
+        terminal_event={
+            "kind": "worker_terminal",
+            "outcome": "completed",
+            "producer_task_id": "worker-1",
+            "producer_invocation_id": "turn-1",
+            "result_ref": "reports/worker-1.md",
+        },
+        now=101.0,
+    )
+
+    assert published.terminal_event["result_ref_provenance"] == "publisher_declared"
+    assert published.terminal_event["lead_accepted"] is False
+    ledger.close()
+    reopened = Ledger(tmp_path)
+    assert reopened.get_event("worker-references").status_dict() == published.status_dict()
+
+
 def test_worker_completed_settlement_is_immutable_and_has_no_delivery_attestation(
     tmp_path,
 ) -> None:

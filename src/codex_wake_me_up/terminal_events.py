@@ -447,6 +447,8 @@ class WorkerTerminalEvent:
     producer_task_id: str
     candidate_oid: str | None = None
     reason: str | None = None
+    producer_invocation_id: str | None = None
+    result_ref: str | None = None
     producer_timestamp: float | str | None = None
     host_received_at: float | None = None
     kind: EventKind = field(default=EventKind.WORKER_TERMINAL, init=False)
@@ -463,6 +465,18 @@ class WorkerTerminalEvent:
             object.__setattr__(self, "candidate_oid", _full_oid(self.candidate_oid))
         if self.reason is not None:
             object.__setattr__(self, "reason", _bounded_text(self.reason, "worker reason"))
+        if self.producer_invocation_id is not None:
+            object.__setattr__(
+                self,
+                "producer_invocation_id",
+                _bounded_text(self.producer_invocation_id, "worker invocation identity"),
+            )
+        if self.result_ref is not None:
+            object.__setattr__(
+                self,
+                "result_ref",
+                _bounded_text(self.result_ref, "worker result reference"),
+            )
         if self.producer_timestamp is not None:
             object.__setattr__(
                 self,
@@ -509,6 +523,11 @@ class WorkerTerminalEvent:
             payload["candidate_oid"] = self.candidate_oid
         if self.reason is not None:
             payload["reason"] = self.reason
+        if self.producer_invocation_id is not None:
+            payload["producer_invocation_id"] = self.producer_invocation_id
+        if self.result_ref is not None:
+            payload["result_ref"] = self.result_ref
+            payload["result_ref_provenance"] = "publisher_declared"
         if self.producer_timestamp is not None:
             payload["producer_at"] = self.producer_timestamp
         return payload
@@ -620,10 +639,18 @@ def normalize_worker_terminal(
         "candidate_oid",
         "candidate_commit",
         "candidate_commit_oid",
+        "producer_invocation_id",
+        "result_ref",
+        "result_ref_provenance",
         "producer_at",
         "producer_timestamp",
     }
     _event_keys(mapping, allowed)
+    provenance = mapping.get("result_ref_provenance")
+    if provenance is not None and provenance != "publisher_declared":
+        raise _validation("worker result reference provenance is invalid")
+    if provenance is not None and mapping.get("result_ref") is None:
+        raise _validation("worker result reference provenance requires a result reference")
     if "kind" in mapping and _enum(mapping["kind"], EventKind, "event kind") is not EventKind.WORKER_TERMINAL:
         raise _validation("worker event has the wrong kind")
     candidate = _optional_alias(
@@ -643,6 +670,8 @@ def normalize_worker_terminal(
         producer_task_id=mapping.get("producer_task_id", _MISSING),
         candidate_oid=candidate,
         reason=mapping.get("reason"),
+        producer_invocation_id=mapping.get("producer_invocation_id"),
+        result_ref=mapping.get("result_ref"),
         producer_timestamp=producer_at,
         host_received_at=_host_time(host_received_at) if host_received_at is not None else None,
     )

@@ -386,6 +386,7 @@ class MonitorRecord:
     queue_receipt: Mapping[str, Any] | None = None
     reconciliation: Mapping[str, Any] | None = None
     delivery_outcome: Mapping[str, Any] | None = None
+    target_status_observed_at: float | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "MonitorRecord":
@@ -434,6 +435,11 @@ class MonitorRecord:
             queue_receipt=_load(row["queue_receipt_json"], None),
             reconciliation=_load(row["reconciliation_json"], None),
             delivery_outcome=_load(row["delivery_outcome_json"], None),
+            target_status_observed_at=(
+                float(row["target_status_observed_at"])
+                if row["target_status_observed_at"] is not None
+                else None
+            ),
         )
 
     @property
@@ -482,6 +488,7 @@ class MonitorRecord:
             "queue_receipt": self.queue_receipt,
             "reconciliation": self.reconciliation,
             "delivery_outcome": self.delivery_outcome,
+            "target_status_observed_at": self.target_status_observed_at,
         }
 
 
@@ -546,6 +553,7 @@ class Ledger:
                 ,queue_receipt_json TEXT
                 ,reconciliation_json TEXT
                 ,delivery_outcome_json TEXT
+                ,target_status_observed_at REAL
             )
             """
         )
@@ -580,6 +588,7 @@ class Ledger:
             ("queue_receipt_json", "TEXT"),
             ("reconciliation_json", "TEXT"),
             ("delivery_outcome_json", "TEXT"),
+            ("target_status_observed_at", "REAL"),
         ):
             if name not in columns:
                 connection.execute(
@@ -1195,6 +1204,44 @@ class Ledger:
                     tuple(state.value for state in MonitorState if is_terminal(state)),
                 ).fetchall()
         return [MonitorRecord.from_row(row) for row in rows]
+
+    def record_target_status_observed(
+        self, monitor_id: str, *, target_thread_id: str, now: float | None = None
+    ) -> MonitorRecord | None:
+        """Record an authenticated target's status read without changing delivery state."""
+
+        observed_at = time.time() if now is None else float(now)
+        transaction = self._transaction()
+        try:
+            row = transaction.execute(
+                "SELECT * FROM monitors WHERE monitor_id = ?", (monitor_id,)
+            ).fetchone()
+            if row is None:
+                self._commit()
+                return None
+            record = MonitorRecord.from_row(row)
+            delivery = record.delivery or {}
+            if (
+                record.delivery_kind is not DeliveryKind.THREAD
+                or delivery.get("thread_id") != target_thread_id
+                or record.queue_receipt is None
+            ):
+                self._commit()
+                return record
+            if record.target_status_observed_at is None:
+                transaction.execute(
+                    "UPDATE monitors SET target_status_observed_at = ?, updated_at = ? "
+                    "WHERE monitor_id = ?",
+                    (observed_at, observed_at, monitor_id),
+                )
+                row = transaction.execute(
+                    "SELECT * FROM monitors WHERE monitor_id = ?", (monitor_id,)
+                ).fetchone()
+            self._commit()
+            return self._record(row)
+        except BaseException:
+            self._rollback()
+            raise
 
     def create_or_get(
         self,

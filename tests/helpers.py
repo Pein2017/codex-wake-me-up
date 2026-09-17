@@ -75,6 +75,7 @@ class FakeAppServer:
         # may be one observation, a list consumed in order, or an exception.
         self.thread_observations = dict(thread_observations or {})
         self.child_reads: list[str] = []
+        self.child_read_include_goal: list[bool] = []
         self.native_worker_observations = dict(native_worker_observations or {})
         self.native_worker_reads: list[dict[str, str | None]] = []
 
@@ -84,9 +85,12 @@ class FakeAppServer:
     async def __aexit__(self, *_args: Any) -> None:
         return None
 
-    async def read_observation(self, thread_id: str) -> TargetObservation:
+    async def read_observation(
+        self, thread_id: str, *, include_goal: bool = True
+    ) -> TargetObservation:
         if thread_id in self.thread_observations:
             self.child_reads.append(thread_id)
+            self.child_read_include_goal.append(include_goal)
             scripted = self.thread_observations[thread_id]
             if isinstance(scripted, list):
                 if len(scripted) > 1:

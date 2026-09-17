@@ -13,6 +13,7 @@ from codex_wake_me_up.models import (
     AppServerError,
     AppServerRejectedError,
     AppServerTransportError,
+    AppServerUnsupportedMethodError,
 )
 from pathlib import Path
 
@@ -51,6 +52,42 @@ def test_request_timeout_is_typed_as_transport_failure(tmp_path) -> None:
 
     with pytest.raises(AppServerTransportError, match="thread/read timed out"):
         asyncio.run(client._request("thread/read", {"threadId": "thread-1"}))
+
+
+def test_unknown_core_method_is_sanitized_and_typed(tmp_path) -> None:
+    class RejectedWebsocket:
+        async def send_json(self, _payload) -> None:
+            return None
+
+        async def receive(self):
+            return type(
+                "Message",
+                (),
+                {
+                    "type": aiohttp.WSMsgType.TEXT,
+                    "json": lambda _self: {
+                        "id": 1,
+                        "error": {
+                            "code": -32600,
+                            "message": (
+                                "Invalid request: unknown variant "
+                                "thread/agent/observe, expected "
+                                "thread/read,thread/queue/add," + "x" * 4096
+                            ),
+                        },
+                    },
+                },
+            )()
+
+    client = AppServerClient(tmp_path)
+    client._websocket = RejectedWebsocket()
+
+    with pytest.raises(AppServerUnsupportedMethodError) as caught:
+        asyncio.run(client._request("thread/agent/observe", {}))
+
+    assert caught.value.method == "thread/agent/observe"
+    assert "expected" not in str(caught.value)
+    assert len(str(caught.value)) < 256
 
 
 def test_socket_stat_permission_failure_is_definitive(tmp_path) -> None:
@@ -200,6 +237,39 @@ def test_read_observation_accepts_matching_positive_thread_identities() -> None:
     result = asyncio.run(StubClient().read_observation("requested"))
     assert result.thread_id == "requested"
     assert result.goal_status == "paused"
+
+
+def test_runtime_only_observation_does_not_read_goal() -> None:
+    class StubClient(AppServerClient):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def _request(self, method, _params):
+            self.calls.append(method)
+            if method == "thread/read":
+                return {"thread": {"id": "requested", "status": {"type": "idle"}}}
+            raise AssertionError(method)
+
+    client = StubClient()
+    result = asyncio.run(client.read_observation("requested", include_goal=False))
+
+    assert result.goal is None
+    assert result.goal_status is None
+    assert client.calls == ["thread/read"]
+
+
+def test_native_worker_capability_reports_unsupported_method() -> None:
+    class StubClient(AppServerClient):
+        async def _request(self, method, _params):
+            raise AppServerUnsupportedMethodError(method)
+
+    result = asyncio.run(StubClient().native_worker_observation_capability())
+
+    assert result == {
+        "state": "unavailable",
+        "required_capability": "thread/agent/observe",
+        "reason": "unsupported_method",
+    }
 
 
 def test_native_worker_observer_binds_then_reads_one_exact_invocation() -> None:

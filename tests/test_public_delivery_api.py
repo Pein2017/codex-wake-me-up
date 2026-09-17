@@ -9,7 +9,7 @@ from mcp.shared.context import RequestContext
 from mcp.types import RequestParams
 
 from codex_wake_me_up import cli, mcp_server
-from codex_wake_me_up.models import ValidationError
+from codex_wake_me_up.models import PreArmRegistrationError, ValidationError
 
 
 class FakeService:
@@ -136,6 +136,86 @@ def test_wait_for_event_rejects_an_absent_request_context_before_service(
         )
 
     assert fake.calls == []
+
+
+def test_mcp_returns_structured_prearm_failure_without_monitor(monkeypatch) -> None:
+    class FailingService(FakeService):
+        async def wait_for_current_event(self, **_payload):
+            raise PreArmRegistrationError(
+                stage="prepare_condition",
+                error_kind="unsupported_condition",
+                error="app-server does not support required method: thread/agent/observe",
+                safe_to_retry=False,
+                retry_attempted=False,
+                required_capability="thread/agent/observe",
+            )
+
+    fake = FailingService()
+    monkeypatch.setattr(mcp_server, "_service", fake)
+
+    result = asyncio.run(
+        mcp_server.wait_for_event(
+            condition={"type": "native_worker_terminal", "task_name": "/root/worker"},
+            expires_in_seconds=100,
+            idempotency_key="unsupported-native-worker",
+            ctx=_mcp_context("thread-1"),
+        )
+    )
+
+    assert result == {
+        "state": "not_created",
+        "monitor_created": False,
+        "stage": "prepare_condition",
+        "error": {
+            "kind": "unsupported_condition",
+            "message": "app-server does not support required method: thread/agent/observe",
+        },
+        "safe_to_retry": False,
+        "retry_attempted": False,
+        "required_capability": "thread/agent/observe",
+    }
+
+
+def test_capability_and_status_mcp_surfaces_use_the_trusted_caller(monkeypatch) -> None:
+    class CapabilityService(FakeService):
+        async def runtime_capabilities(self):
+            return {
+                "plugin": {"source_identity": "test"},
+                "daemon": {"delivery_ready": True, "reason": None},
+                "core": {
+                    "native_worker_observation": {
+                        "state": "unavailable",
+                        "required_capability": "thread/agent/observe",
+                        "reason": "unsupported_method",
+                    }
+                },
+            }
+
+        def decision_status(self, monitor_id: str, **payload):
+            self.calls.append(("decision_status", {"monitor_id": monitor_id, **payload}))
+            return {"monitor_id": monitor_id}
+
+        def list_for_target(self, thread_id: str):
+            self.calls.append(("list_for_target", {"thread_id": thread_id}))
+            return []
+
+    fake = CapabilityService()
+    monkeypatch.setattr(mcp_server, "_service", fake)
+
+    capabilities = asyncio.run(mcp_server.wake_me_up_capabilities())
+    status = mcp_server.wake_me_up_status("monitor-1", ctx=_mcp_context("thread-1"))
+    listed = mcp_server.wake_me_up_current_monitors(_mcp_context("thread-1"))
+
+    assert capabilities["core"]["native_worker_observation"]["state"] == "unavailable"
+    assert status == {"monitor_id": "monitor-1"}
+    assert listed == []
+    assert fake.calls == [
+        (
+            "decision_status",
+            {"monitor_id": "monitor-1", "trusted_target_thread_id": "thread-1"},
+        ),
+        ("list_for_target", {"thread_id": "thread-1"}),
+    ]
 
 
 def test_cli_exposes_thread_wait_goal_defer_status_and_cancel_controls() -> None:

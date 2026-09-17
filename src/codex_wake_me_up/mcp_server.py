@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from .models import ValidationError
+from .models import PreArmRegistrationError, ValidationError
 from .payloads import load_private_json_payload
 from .service import MonitorService
 
@@ -14,8 +14,9 @@ from .service import MonitorService
 mcp = FastMCP(
     "Codex Wake Me Up",
     instructions=(
-        "Use wait_for_event for ordinary waits bound to the trusted current task; "
-        "never create a goal or launch its producer. End only after state=armed. "
+        "Use wait_for_event for ordinary waits regardless of goal state, bound to "
+        "the trusted current task; do not create a goal or launch its producer. "
+        "end the current turn only after state=armed. "
         "Delivery is billed, not exactly-once, and not task success; then read "
         "wake_me_up_status once. Use defer_goal_until_event only for explicit "
         "legacy goal pause/reactivation."
@@ -29,6 +30,18 @@ def service() -> MonitorService:
     if _service is None:
         _service = MonitorService()
     return _service
+
+
+def _trusted_thread_id(ctx: Context | None) -> str | None:
+    if ctx is None:
+        return None
+    try:
+        request_context = ctx.request_context
+    except ValueError:
+        request_context = None
+    meta = request_context.meta if request_context is not None else None
+    thread_id = getattr(meta, "threadId", None)
+    return thread_id.strip() if isinstance(thread_id, str) and thread_id.strip() else None
 
 
 @mcp.tool(
@@ -46,23 +59,32 @@ async def wait_for_event(
     ctx: Context,
     rearm_of: str | None = None,
 ) -> dict[str, Any]:
-    try:
-        request_context = ctx.request_context
-    except ValueError:
-        request_context = None
-    meta = request_context.meta if request_context is not None else None
-    thread_id = getattr(meta, "threadId", None)
-    if not isinstance(thread_id, str) or not thread_id.strip():
+    thread_id = _trusted_thread_id(ctx)
+    if thread_id is None:
         raise ValidationError(
             "wait_for_event requires the trusted Codex caller thread identity"
         )
-    return await service().wait_for_current_event(
-        thread_id=thread_id.strip(),
-        condition=condition,
-        expires_in_seconds=expires_in_seconds,
-        idempotency_key=idempotency_key,
-        rearm_of=rearm_of,
-    )
+    try:
+        return await service().wait_for_current_event(
+            thread_id=thread_id,
+            condition=condition,
+            expires_in_seconds=expires_in_seconds,
+            idempotency_key=idempotency_key,
+            rearm_of=rearm_of,
+        )
+    except PreArmRegistrationError as exc:
+        return exc.as_dict()
+
+
+@mcp.tool(
+    name="wake_me_up_capabilities",
+    description=(
+        "Read the current plugin, daemon, and Core capability boundary without "
+        "creating a monitor or changing a task."
+    ),
+)
+async def wake_me_up_capabilities() -> dict[str, Any]:
+    return await service().runtime_capabilities()
 
 
 @mcp.tool(
@@ -150,13 +172,33 @@ async def wake_me_up_defer(
     ),
 )
 def wake_me_up_status(
-    monitor_id: str, view: Literal["decision", "audit"] = "decision"
+    monitor_id: str,
+    view: Literal["decision", "audit"] = "decision",
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
+    trusted_target_thread_id = _trusted_thread_id(ctx)
     if view == "decision":
-        return service().decision_status(monitor_id)
+        return service().decision_status(
+            monitor_id, trusted_target_thread_id=trusted_target_thread_id
+        )
     if view == "audit":
-        return service().status(monitor_id)
+        return service().status(
+            monitor_id, trusted_target_thread_id=trusted_target_thread_id
+        )
     raise ValidationError("view must be decision or audit")
+
+
+@mcp.tool(
+    name="wake_me_up_current_monitors",
+    description="List compact monitors whose frozen thread-delivery target is the trusted current task.",
+)
+def wake_me_up_current_monitors(ctx: Context) -> list[dict[str, Any]]:
+    thread_id = _trusted_thread_id(ctx)
+    if thread_id is None:
+        raise ValidationError(
+            "wake_me_up_current_monitors requires the trusted Codex caller thread identity"
+        )
+    return service().list_for_target(thread_id)
 
 
 @mcp.tool(

@@ -17,14 +17,20 @@ host-local process with a stable witness.
    terminal event when available; keep its private publisher descriptor with
    that launcher and retain the returned non-secret `monitor_condition`. A
    foreground tool call does not become durable merely because the turn ends.
-2. Choose the strongest condition the producer can bind:
-   `native_worker_terminal` for an ordinary spawned Codex worker;
+2. Before choosing `native_worker_terminal`, call `wake_me_up_capabilities`.
+   Use it only when `core.native_worker_observation.state` is `available`.
+   When it is `unavailable` or `indeterminate`, keep the Core reason and choose
+   an independently available producer witness; never silently replace native
+   settlement with `thread_idle`.
+3. Choose the strongest condition the producer can bind:
+   `native_worker_terminal` for an ordinary spawned Codex worker only when the
+   capability report permits it;
    `command_terminal` or cooperative `worker_terminal`; monitor-bound `receipt_success`;
    the producer's success-and-failure log or receipt through `log_pattern`;
    `any(log_pattern, pid_exit(actual producer))`; then bare `pid_exit`.
    `tmux_exit`, GPU state, deadlines, and thread idle are weaker lifecycle or
    resource witnesses.
-3. Launch through that existing launcher, then call goal-independent
+4. Launch through that existing launcher, then call goal-independent
    `wait_for_event` once with its returned typed condition, a bounded expiry,
    and a stable `idempotency_key`. Do not provide a task ID; trusted MCP metadata
    binds the current task and resolves a spawned child to its root delivery
@@ -51,21 +57,21 @@ host-local process with a stable witness.
 }
 ```
 
-4. Treat only a clear `armed` receipt as the handoff barrier. It identifies the
+5. Treat only a clear `armed` receipt as the handoff barrier. It identifies the
    monitor, compact condition binding, expiry, origin, root delivery target,
    delivery kind, supervision, and next action. If registration fails or is
    ambiguous, report it and remain active; do not assume a later wake.
-5. After `armed`, report the monitor ID and end the current turn. “Do not wait”
+6. After `armed`, report the monitor ID and end the current turn. “Do not wait”
    means do not synchronously join; it does not mean omit the asynchronous arm.
    Do not sleep, poll, or issue a long tool wait for the monitored interval; the
    daemon owns observation.
-6. A delivered pointer is bounded routing data, not a result or success claim.
+7. A delivered pointer is bounded routing data, not a result or success claim.
    Call `wake_me_up_status(monitor_id, view="decision")` exactly once. That one
    response contains the witness or observer failure, wait statistics, selected
    delivery facts, abnormal delivery diagnostics, and terminal-event evidence.
    Decide from it without calling an additional details endpoint.
 
-For an ordinary spawned Codex worker, use
+For an ordinary spawned Codex worker whose capability report is `available`, use
 `{"type":"native_worker_terminal","task_name":"/root/worker"}` with the
 canonical name returned by spawn. Core freezes its exact child thread and turn
 invocation; completed, failed, and interrupted all wake as settlement,
@@ -79,6 +85,11 @@ launcher preflights its private mode-0600 descriptor before work and later publi
 a separate mode-0600 event file; never put its bearer in arguments or output. A
 worker that exits before this final publish is not observed as settled and waits
 for expiry.
+
+A worker terminal payload may include bounded opaque `producer_invocation_id`
+and `result_ref`. They are shown as `publisher_declared` handling evidence in
+the wake report; this plugin does not open the reference and they never prove
+task success or acceptance.
 
 ## Condition rules
 
@@ -115,6 +126,9 @@ for expiry.
   fresh `wait_for_event` with a new key and `rearm_of`; a prior thread monitor
   may already be `queue_accepted`, but remains nonterminal and is never resent.
   Nothing re-arms itself.
+- `wake_me_up_current_monitors` lists only monitors whose frozen delivery target
+  is the trusted current task. A target's `wake_me_up_status` read is recorded
+  as delivery-consumption evidence, not as proof it understood or accepted work.
 - Use one composed `all` monitor to wake after every worker settles. For
   continuing first-settlement control, arm independent single-leaf monitors;
   retain or cancel survivors explicitly. Typed `any` consumes losers.

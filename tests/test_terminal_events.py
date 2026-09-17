@@ -155,6 +155,46 @@ def test_worker_completed_is_non_successful_settlement_without_a_candidate() -> 
     }
 
 
+def test_worker_terminal_preserves_declared_invocation_and_result_reference() -> None:
+    event = normalize_worker_terminal(
+        worker_payload(
+            producer_invocation_id="turn-7",
+            result_ref="reports/worker-7.md",
+        )
+    )
+
+    assert event.as_status()["producer_invocation_id"] == "turn-7"
+    assert event.as_status()["result_ref"] == "reports/worker-7.md"
+    assert event.as_status()["result_ref_provenance"] == "publisher_declared"
+    assert event.as_status()["lead_accepted"] is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"producer_invocation_id": ""},
+        {"result_ref": ""},
+        {"producer_invocation_id": "i" * (MAX_STRING_BYTES + 1)},
+        {"result_ref": "r" * (MAX_STRING_BYTES + 1)},
+    ],
+)
+def test_worker_terminal_rejects_invalid_declared_references(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        normalize_worker_terminal(worker_payload(**overrides))
+
+
+def test_changed_declared_result_reference_is_not_an_idempotent_retry() -> None:
+    original = normalize_worker_terminal(worker_payload(result_ref="reports/one.md"))
+
+    with pytest.raises(ConflictError, match="immutable"):
+        validate_terminal_rewrite(
+            original,
+            worker_payload(result_ref="reports/two.md"),
+        )
+
+
 def test_worker_completed_rejects_a_candidate_commit() -> None:
     with pytest.raises(ValidationError, match="must not claim"):
         normalize_worker_terminal(

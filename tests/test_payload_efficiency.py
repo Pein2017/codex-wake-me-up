@@ -27,7 +27,7 @@ def _canonical_bytes(value: object) -> int:
     )
 
 
-def test_compact_arm_receipt_is_at_least_60_percent_smaller(tmp_path) -> None:
+def test_compact_arm_receipt_is_at_least_58_percent_smaller_with_summary(tmp_path) -> None:
     log = tmp_path / "job.log"
     log.write_text("booting\n", encoding="utf-8")
     service = _thread_service(tmp_path, FakeThreadDelivery(), Clock())
@@ -55,7 +55,7 @@ def test_compact_arm_receipt_is_at_least_60_percent_smaller(tmp_path) -> None:
         )
     )
 
-    assert _canonical_bytes(receipt) <= ARM_BASELINE_BYTES * 0.40
+    assert _canonical_bytes(receipt) <= ARM_BASELINE_BYTES * 0.42
     assert receipt["condition"]["type"] == "any"
     assert receipt["delivery"] == {
         "kind": "thread",
@@ -63,7 +63,8 @@ def test_compact_arm_receipt_is_at_least_60_percent_smaller(tmp_path) -> None:
         "origin_thread_id": "thread-1",
         "target_thread_id": "thread-1",
     }
-    assert receipt["next_action"] == "end_current_turn"
+    assert receipt["next_action"].startswith("end turn; any -> thread-1")
+    assert receipt["next_action"].endswith("not acceptance")
     assert "capability" not in receipt["delivery"]
     assert "outcome" not in receipt
     assert len(receipt) <= 10

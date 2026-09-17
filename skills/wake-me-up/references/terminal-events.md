@@ -53,6 +53,9 @@ integration exists.
   settlement could not be validated and explicitly remains non-success.
   `delivered` carries a candidate commit and bounded Git attestation for
   independent lead review; it is never lead or task acceptance.
+- A worker may also declare bounded opaque `producer_invocation_id` and
+  `result_ref`. Status labels the latter `publisher_declared`; neither reference
+  is dereferenced or validated by this plugin, and neither is acceptance.
 - Missing, baseline-mismatched, out-of-scope, or errored worker attestation still
   wakes with failure evidence. Do not wait for expiry or promote it to success.
 - `heartbeat_stale` is heuristic liveness evidence: accepted heartbeats stopped

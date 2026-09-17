@@ -115,12 +115,27 @@ claimed monitor; it cannot undo an activation already recorded as `activating`,
 nor compensate for a possibly delivered pause. `wake_me_up_publish_receipt`
 writes a monitor's receipt atomically.
 
+`wake_me_up_capabilities` is a read-only report of the loaded plugin, daemon,
+and Core boundary. Check it before using `native_worker_terminal`: an
+`unavailable` result names `thread/agent/observe` without dumping Core's method
+catalogue, and an `indeterminate` result names the bounded transport/probe
+reason. Neither result creates a monitor or silently falls back to
+`thread_idle`. `wake_me_up_current_monitors` returns only monitors frozen to the
+trusted current task. A trusted target's status read is recorded separately from
+condition, queue recording, and task acceptance.
+
 Registration also has a dedicated compact projection: an armed receipt contains
 only monitor/idempotency identity, state, compact condition binding, expiry,
 origin and root delivery target, delivery kind, supervision, targeting, next
 action, and any required receipt instructions. Full capability, empty evidence,
 witness, outcome, and reconciliation fields remain in durable audit status, not
 the ordinary model response.
+
+If target resolution or condition preparation fails before monitor creation,
+`wait_for_event` returns `state=not_created`, `monitor_created=false`, a stable
+stage, a compact error class, and retry safety. It performs at most one retry for
+a typed read-only local transport failure before any ledger row or queue
+admission; it never reuses this rule after a durable delivery attempt.
 
 The MCP request timeout is only a control-call bound. Once registration returns
 an `armed` durable receipt, the detached daemon owns observation and delivery
@@ -221,6 +236,9 @@ claims:
   success, or lead acceptance. If a cooperative native worker exits before its
   final publish, the monitor wakes only at expiry. Ordinary Codex native workers
   instead use the host-observed `native_worker_terminal` condition below.
+  A worker may attach bounded opaque `producer_invocation_id` and `result_ref`.
+  Status preserves the latter as `publisher_declared` evidence without opening,
+  validating, or treating it as acceptance.
 
 Every command terminal outcome wakes when bound, including succeeded, failed,
 cancelled, and signaled. Every worker terminal outcome also wakes when bound,
@@ -357,8 +375,9 @@ A child already idle at registration is **rejected**: that result belongs in
 the current turn, not behind an expiry-length wait. Pass
 `accept_already_idle: true` to override. An unloaded or missing child is
 `unknown`, never `true` — disappearance is not completion. The witness carries
-the child's runtime status, goal status, and usage snapshot. An ended turn is
-not task success; read the child's actual output.
+the child's runtime status only; the observer does not read a goal merely to
+watch turn completion. An ended turn is not task success; read the child's
+actual output.
 
 ### `native_worker_terminal`
 
@@ -383,6 +402,10 @@ the selected monitor still makes only one root queue-add attempt.
 This is not `thread_idle`: unloading and generic idle are not native settlement.
 It is also not cooperative `worker_terminal`, which remains the richer publisher
 contract for candidates and attestations.
+
+Call `wake_me_up_capabilities` first. If its native-worker observation is not
+`available`, registration fails closed with `monitor_created=false` and a
+structured required-capability reason; do not replace it with `thread_idle`.
 
 ### `receipt_success`
 

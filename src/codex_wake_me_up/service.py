@@ -35,9 +35,11 @@ from .models import (
     AppServerError,
     AppServerRejectedError,
     AppServerTransportError,
+    AppServerUnsupportedMethodError,
     ConflictError,
     MonitorMode,
     MonitorState,
+    PreArmRegistrationError,
     TargetGuard,
     TargetObservation,
     TriState,
@@ -55,6 +57,7 @@ from .runtime import (
     ensure_daemon_ready,
     ensure_event_daemon_ready,
     ensure_delivery_daemon_ready,
+    loaded_source_identity,
     runtime_root,
     validate_private_output_path,
 )
@@ -399,6 +402,99 @@ class MonitorService:
             _caller_binding=_TRUSTED_MCP_CALLER_BINDING,
         )
 
+    @staticmethod
+    def _prearm_error(
+        stage: str, error: AppServerError, *, retry_attempted: bool
+    ) -> PreArmRegistrationError:
+        required_capability = (
+            error.method
+            if isinstance(error, AppServerUnsupportedMethodError)
+            else None
+        )
+        if required_capability is not None:
+            kind = "unsupported_condition"
+            safe_to_retry = False
+        elif isinstance(error, AppServerTransportError):
+            kind = "transport_failure"
+            safe_to_retry = True
+        elif isinstance(error, AppServerRejectedError):
+            kind = "app_server_rejected"
+            safe_to_retry = False
+        else:
+            kind = "invalid_observation"
+            safe_to_retry = False
+        return PreArmRegistrationError(
+            stage=stage,
+            error_kind=kind,
+            error=str(error)[:512],
+            safe_to_retry=safe_to_retry,
+            retry_attempted=retry_attempted,
+            required_capability=required_capability,
+        )
+
+    async def _prearm_read(
+        self,
+        stage: str,
+        factory: AppServerFactory,
+        operation: Callable[[Any], Any],
+    ) -> Any:
+        """Run one read-only registration observation with at most one retry."""
+
+        retry_attempted = False
+        while True:
+            try:
+                async with factory() as app_server:
+                    return await operation(app_server)
+            except AppServerTransportError as exc:
+                if not retry_attempted:
+                    retry_attempted = True
+                    continue
+                raise self._prearm_error(
+                    stage, exc, retry_attempted=True
+                ) from exc
+            except AppServerError as exc:
+                raise self._prearm_error(
+                    stage, exc, retry_attempted=retry_attempted
+                ) from exc
+
+    async def runtime_capabilities(self) -> dict[str, Any]:
+        """Read installed plugin/daemon/Core capability facts without a monitor write."""
+
+        daemon_reason = delivery_daemon_unready_reason(self.root)
+        core: dict[str, Any]
+        try:
+            async with self.app_server_factory() as app_server:
+                core = {
+                    "native_worker_observation": (
+                        await app_server.native_worker_observation_capability()
+                    ),
+                    "server": dict(getattr(app_server, "server_info", {}) or {}),
+                }
+        except AppServerTransportError:
+            core = {
+                "native_worker_observation": {
+                    "state": "indeterminate",
+                    "required_capability": "thread/agent/observe",
+                    "reason": "transport_failure",
+                }
+            }
+        except AppServerError:
+            core = {
+                "native_worker_observation": {
+                    "state": "indeterminate",
+                    "required_capability": "thread/agent/observe",
+                    "reason": "invalid_probe_response",
+                }
+            }
+        return {
+            "plugin": {"source_identity": loaded_source_identity()},
+            "daemon": {
+                "delivery_ready": daemon_reason is None,
+                "reason": daemon_reason,
+            },
+            "core": core,
+        }
+
     async def wait_for_event(
         self,
         *,
@@ -459,14 +555,11 @@ class MonitorService:
             raise ValidationError(
                 "event monitor requires an exact event-capable daemon before arming"
             )
-        try:
-            async with self.thread_delivery_factory() as app_server:
-                capability = await app_server.resolve_thread_delivery(thread_id)
-        except AppServerError as exc:
-            raise AppServerError(
-                "thread delivery registration failed: "
-                f"stage=resolve_delivery_target error={exc}"
-            ) from exc
+        capability = await self._prearm_read(
+            "resolve_delivery_target",
+            self.thread_delivery_factory,
+            lambda app_server: app_server.resolve_thread_delivery(thread_id),
+        )
         if capability.get("origin_thread_id") != thread_id:
             raise ValidationError("thread delivery resolved a different origin")
         delivery_thread_id = capability.get("delivery_thread_id")
@@ -501,23 +594,19 @@ class MonitorService:
             raise ValidationError(
                 "native_worker_terminal requires the trusted current root binding"
             )
-        try:
-            async with self.app_server_factory() as app_server:
-                observer_context.thread_observations.update(
-                    await self._read_thread_observations(
-                        app_server, children, fail_on_error=True
-                    )
+        async def prepare(app_server: Any) -> None:
+            observer_context.thread_observations.update(
+                await self._read_thread_observations(
+                    app_server, children, fail_on_error=True
                 )
-                observer_context.native_worker_observations.update(
-                    await self._read_native_worker_observations(
-                        app_server, native_workers
-                    )
+            )
+            observer_context.native_worker_observations.update(
+                await self._read_native_worker_observations(
+                    app_server, native_workers
                 )
-        except AppServerError as exc:
-            raise AppServerError(
-                "thread delivery registration failed: "
-                f"stage=prepare_condition error={exc}"
-            ) from exc
+            )
+
+        await self._prearm_read("prepare_condition", self.app_server_factory, prepare)
         receipt_token = secrets.token_urlsafe(32)
         prepared_condition = prepare_condition(
             condition,
@@ -774,21 +863,10 @@ class MonitorService:
 
     @staticmethod
     def _thread_observation_summary(observation: TargetObservation) -> dict[str, Any]:
-        snapshot = observation.goal_snapshot or {}
         return {
             "thread_id": observation.thread_id,
             "runtime_status": observation.runtime_status,
             "is_loaded": observation.is_loaded,
-            "goal_status": observation.goal_status,
-            "usage": (
-                {
-                    "tokens_used": snapshot.get("tokensUsed"),
-                    "time_used_seconds": snapshot.get("timeUsedSeconds"),
-                    "token_budget": snapshot.get("tokenBudget"),
-                }
-                if observation.goal_snapshot
-                else None
-            ),
         }
 
     async def _read_thread_observations(
@@ -803,7 +881,7 @@ class MonitorService:
         observations: dict[str, Mapping[str, Any] | None] = {}
         for child_id in targets:
             try:
-                child = await app_server.read_observation(child_id)
+                child = await app_server.read_observation(child_id, include_goal=False)
             except AppServerError:
                 if fail_on_error:
                     raise
@@ -1387,7 +1465,10 @@ class MonitorService:
                 "authenticated_current_task": False,
             }
         if record.state == MonitorState.ARMED:
-            response["next_action"] = "end_current_turn"
+            response["next_action"] = (
+                f"end turn; {_condition_binding_summary(record.condition)['type']} -> "
+                f"{target_thread_id} by {record.expires_at:.0f}; not acceptance"
+            )
         elif record.outcome:
             response["outcome"] = dict(record.outcome)
         elif record.evidence:
@@ -1399,8 +1480,23 @@ class MonitorService:
             response["receipt_instructions"] = receipts
         return response
 
-    def status(self, monitor_id: str) -> dict[str, Any]:
-        record = self.ledger.get(monitor_id)
+    def _record_target_status_observed(
+        self, monitor_id: str, trusted_target_thread_id: str | None
+    ) -> MonitorRecord | None:
+        if trusted_target_thread_id is None:
+            return self.ledger.get(monitor_id)
+        return self.ledger.record_target_status_observed(
+            monitor_id,
+            target_thread_id=trusted_target_thread_id,
+            now=self.observer_context_factory().now(),
+        )
+
+    def status(
+        self, monitor_id: str, *, trusted_target_thread_id: str | None = None
+    ) -> dict[str, Any]:
+        record = self._record_target_status_observed(
+            monitor_id, trusted_target_thread_id
+        )
         if record is None:
             raise ValidationError(f"unknown monitor: {monitor_id}")
         value = record.status_dict()
@@ -1423,10 +1519,14 @@ class MonitorService:
             value["supervision"] = "not_required"
         return value
 
-    def decision_status(self, monitor_id: str) -> dict[str, Any]:
+    def decision_status(
+        self, monitor_id: str, *, trusted_target_thread_id: str | None = None
+    ) -> dict[str, Any]:
         """Return the single-call report needed to decide what follows a wake."""
 
-        record = self.ledger.get(monitor_id)
+        record = self._record_target_status_observed(
+            monitor_id, trusted_target_thread_id
+        )
         if record is None:
             raise ValidationError(f"unknown monitor: {monitor_id}")
         report = record.outcome if isinstance(record.outcome, Mapping) else {}
@@ -1529,6 +1629,8 @@ class MonitorService:
             observed_count = record.reconciliation.get("observed_pointer_count")
         if observed_count is not None:
             delivery["observed_pointer_count"] = observed_count
+        if record.target_status_observed_at is not None:
+            delivery["target_status_observed_at"] = record.target_status_observed_at
 
         if (
             record.delivery_kind == DeliveryKind.THREAD
@@ -1600,6 +1702,14 @@ class MonitorService:
 
     def list(self) -> list[dict[str, Any]]:
         return [self.decision_status(record.monitor_id) for record in self.ledger.list()]
+
+    def list_for_target(self, target_thread_id: str) -> list[dict[str, Any]]:
+        return [
+            self.decision_status(record.monitor_id)
+            for record in self.ledger.list()
+            if record.delivery_kind is DeliveryKind.THREAD
+            and (record.delivery or {}).get("thread_id") == target_thread_id
+        ]
 
     def cancel(self, monitor_id: str) -> dict[str, Any]:
         record = self.ledger.cancel(monitor_id)

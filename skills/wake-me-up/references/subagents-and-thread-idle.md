@@ -19,8 +19,12 @@ When the condition fires, root reads
 to continue itself, activate a proven child continuation path, or stop. The
 plugin never resumes, recreates, follows up, or accepts a child.
 
-`{"type":"native_worker_terminal","task_name":"/root/worker"}` is the exact
-native settlement leaf. Registration resolves the public canonical task name
+Call `wake_me_up_capabilities` before selecting
+`{"type":"native_worker_terminal","task_name":"/root/worker"}`. It is the
+exact native settlement leaf only when the report says its required Core method
+is `available`. `unavailable` or `indeterminate` must remain explicit; do not
+substitute `thread_idle` and claim equivalent worker settlement. Registration
+resolves the public canonical task name
 under the trusted root and freezes both its child thread and persisted turn
 invocation. `running` remains false; `completed`, `failed`, and `interrupted`
 settle with distinct evidence and no task-success or lead-acceptance
@@ -34,7 +38,8 @@ retain the single root queue path.
 thread ending its turn. A child already idle is rejected unless
 `accept_already_idle` is explicit; handle its existing result in the current
 turn. Unloaded or missing is unknown, not completion. Idle is a lifecycle
-witness and never proves the child's work succeeded.
+witness and never proves the child's work succeeded. Its observation reads only
+runtime state; it does not query a child's goal merely to watch turn completion.
 
 A spawned child may monitor its own future idle because its root is the delivery
 target. It must not monitor the root whose wake would make that root active.

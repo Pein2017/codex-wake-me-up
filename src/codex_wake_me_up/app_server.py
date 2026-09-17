@@ -15,6 +15,7 @@ from .models import (
     AppServerError,
     AppServerRejectedError,
     AppServerTransportError,
+    AppServerUnsupportedMethodError,
     GoalMarker,
     TargetObservation,
 )
@@ -192,8 +193,28 @@ class AppServerClient:
                             # queue small; matching IDs preserves correctness if one arrives.
                             continue
                         if "error" in payload:
+                            error = payload["error"]
+                            raw_message = (
+                                error.get("message")
+                                if isinstance(error, Mapping)
+                                else str(error)
+                            )
+                            if not isinstance(raw_message, str):
+                                raw_message = "invalid error message"
+                            message = raw_message.split(", expected", 1)[0].strip()
+                            if not message:
+                                message = "unspecified rejection"
+                            message = message[:256]
+                            if "unknown variant" in message and method in message:
+                                raise AppServerUnsupportedMethodError(method)
+                            code = error.get("code") if isinstance(error, Mapping) else None
+                            detail = (
+                                f"code={code} message={message}"
+                                if code is not None
+                                else message
+                            )
                             raise AppServerRejectedError(
-                                f"app-server {method} rejected request: {payload['error']}"
+                                f"app-server {method} rejected request: {detail}"
                             )
                         result = payload.get("result")
                         if not isinstance(result, Mapping):
@@ -220,7 +241,9 @@ class AppServerClient:
                 f"app-server {method} transport failed"
             ) from exc
 
-    async def read_observation(self, thread_id: str) -> TargetObservation:
+    async def read_observation(
+        self, thread_id: str, *, include_goal: bool = True
+    ) -> TargetObservation:
         thread_result = await self._request(
             "thread/read", {"threadId": thread_id, "includeTurns": False}
         )
@@ -239,6 +262,15 @@ class AppServerClient:
             raise AppServerError("thread/read returned no runtime status")
         runtime_status = str(status["type"])
         is_loaded = runtime_status != "notLoaded"
+        if not include_goal:
+            return TargetObservation(
+                thread_id=thread_id,
+                runtime_status=runtime_status,
+                is_loaded=is_loaded,
+                goal_status=None,
+                goal=None,
+                goal_snapshot=None,
+            )
         goal_result = await self._request("thread/goal/get", {"threadId": thread_id})
         goal = goal_result.get("goal")
         if goal is None:
@@ -402,6 +434,42 @@ class AppServerClient:
             "invocation_id": returned_invocation,
             "status": status,
             "error": error,
+        }
+
+    async def native_worker_observation_capability(self) -> dict[str, str]:
+        """Probe only method dispatch; this never binds a task or monitor."""
+
+        method = "thread/agent/observe"
+        try:
+            await self._request(method, {})
+        except AppServerUnsupportedMethodError:
+            return {
+                "state": "unavailable",
+                "required_capability": method,
+                "reason": "unsupported_method",
+            }
+        except AppServerTransportError:
+            return {
+                "state": "indeterminate",
+                "required_capability": method,
+                "reason": "transport_failure",
+            }
+        except AppServerRejectedError:
+            return {
+                "state": "available",
+                "required_capability": method,
+                "reason": "method_dispatched",
+            }
+        except AppServerError:
+            return {
+                "state": "indeterminate",
+                "required_capability": method,
+                "reason": "invalid_probe_response",
+            }
+        return {
+            "state": "available",
+            "required_capability": method,
+            "reason": "method_dispatched",
         }
 
     async def resolve_thread_delivery(self, origin_thread_id: str) -> dict[str, Any]:

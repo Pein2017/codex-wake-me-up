@@ -275,6 +275,94 @@ def test_thread_delivery_resolution_timeout_reports_stage_before_row_creation(
     assert service.ledger.list() == []
 
 
+def test_thread_delivery_retries_one_typed_prearm_transport_failure(tmp_path) -> None:
+    class FlakyDelivery(FakeThreadDelivery):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls = 0
+
+        async def resolve_thread_delivery(self, thread_id: str) -> dict:
+            self.resolve_calls += 1
+            if self.resolve_calls == 1:
+                raise AppServerTransportError("app-server thread/read timed out")
+            return await super().resolve_thread_delivery(thread_id)
+
+    adapter = FlakyDelivery()
+    service = _thread_service(tmp_path, adapter, Clock())
+
+    receipt = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 10},
+            expires_in_seconds=100,
+            idempotency_key="retry-prearm-transport",
+            start_daemon=False,
+        )
+    )
+
+    assert receipt["state"] == MonitorState.ARMED
+    assert adapter.resolve_calls == 2
+    assert len(service.ledger.list()) == 1
+
+
+def test_target_status_observation_is_not_acceptance_and_list_is_scoped(tmp_path) -> None:
+    clock = Clock()
+    service = _thread_service(tmp_path, FakeThreadDelivery(), clock)
+    receipt = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="target-status-observed",
+            start_daemon=False,
+        )
+    )
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+
+    wrong = service.decision_status(
+        receipt["monitor_id"], trusted_target_thread_id="another-thread"
+    )
+    assert "target_status_observed_at" not in wrong["delivery"]
+
+    decision = service.decision_status(
+        receipt["monitor_id"], trusted_target_thread_id="thread-1"
+    )
+    assert decision["delivery"]["target_status_observed_at"] == clock.value
+    assert decision.get("lead_accepted") is not True
+    assert decision.get("task_success") is not True
+    assert [item["monitor_id"] for item in service.list_for_target("thread-1")] == [
+        receipt["monitor_id"]
+    ]
+    assert service.list_for_target("another-thread") == []
+
+
+def test_thread_delivery_exhausted_prearm_transport_is_structured_and_rowless(
+    tmp_path,
+) -> None:
+    class TimedOutDelivery(FakeThreadDelivery):
+        async def resolve_thread_delivery(self, _thread_id: str) -> dict:
+            raise AppServerTransportError("app-server thread/read timed out")
+
+    service = _thread_service(tmp_path, TimedOutDelivery(), Clock())
+
+    with pytest.raises(AppServerError) as caught:
+        asyncio.run(
+            service.wait_for_event(
+                thread_id="thread-1",
+                condition={"type": "time", "after_seconds": 10},
+                expires_in_seconds=100,
+                idempotency_key="exhaust-prearm-transport",
+                start_daemon=False,
+            )
+        )
+
+    assert getattr(caught.value, "stage", None) == "resolve_delivery_target"
+    assert getattr(caught.value, "monitor_created", None) is False
+    assert getattr(caught.value, "safe_to_retry", None) is True
+    assert service.ledger.list() == []
+
+
 def test_thread_condition_read_timeout_reports_stage_before_row_creation(
     tmp_path,
 ) -> None:
@@ -1069,7 +1157,8 @@ def test_wait_for_event_arms_exact_thread_without_reading_or_mutating_a_goal(
     assert result["state"] == MonitorState.ARMED
     assert result["delivery"]["kind"] == DeliveryKind.THREAD
     assert result["delivery"]["target_thread_id"] == "thread-1"
-    assert result["next_action"] == "end_current_turn"
+    assert result["next_action"].startswith("end turn; time -> thread-1")
+    assert result["next_action"].endswith("not acceptance")
     assert result["targeting"]["authenticated_current_task"] is False
     assert adapter.preflight_calls == ["thread-1"]
     assert adapter.add_calls == []
