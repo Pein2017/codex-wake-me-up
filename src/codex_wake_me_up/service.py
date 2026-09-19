@@ -80,10 +80,63 @@ ObserverContextFactory = Callable[[], ObserverContext]
 POLL_YIELD_FLOOR_SECONDS = 180.0
 # Keep serial target and condition reads inside the MCP request budget.
 PREARM_REGISTRATION_BUDGET_SECONDS = 25.0
+# Large thread metadata reads can take a little longer than the old 10s RPC
+# budget; this remains finite and below the shared registration deadline.
+DELIVERY_RETRY_BASE_SECONDS = 5.0
+DELIVERY_RETRY_MAX_SECONDS = 60.0
 WAKE_JOURNAL_TAIL_LINES = 20
 DECISION_JOURNAL_TAIL_RUNS = 8
 MAX_REARM_CHAIN = 20
 _TRUSTED_MCP_CALLER_BINDING = object()
+
+_RECONCILE_PRIORITY = {
+    MonitorState.CLAIMED: 0,
+    MonitorState.ADMISSION_IN_PROGRESS: 1,
+    MonitorState.CANCEL_REQUESTED: 2,
+    MonitorState.CANCELLATION_IN_PROGRESS: 3,
+    MonitorState.ARMED: 4,
+    MonitorState.QUEUE_ACCEPTED: 5,
+}
+_RETRYABLE_DELIVERY_STATES = frozenset(
+    {
+        MonitorState.ADMISSION_IN_PROGRESS,
+        MonitorState.CANCEL_REQUESTED,
+        MonitorState.CANCELLATION_IN_PROGRESS,
+        MonitorState.QUEUE_ACCEPTED,
+    }
+)
+
+
+def _reconcile_priority(record: MonitorRecord) -> tuple[int, float]:
+    return (_RECONCILE_PRIORITY.get(record.state, 99), record.created_at)
+
+
+def _delivery_retry_due(record: MonitorRecord, now: float) -> bool:
+    if record.state not in _RETRYABLE_DELIVERY_STATES:
+        return True
+    reconciliation = record.reconciliation
+    retry_after = reconciliation.get("retry_after") if isinstance(reconciliation, Mapping) else None
+    return not isinstance(retry_after, (int, float)) or isinstance(retry_after, bool) or now >= float(retry_after)
+
+
+def _next_delivery_retry(
+    reconciliation: Mapping[str, Any] | None, now: float
+) -> tuple[int, float]:
+    prior = reconciliation if isinstance(reconciliation, Mapping) else {}
+    previous = prior.get("retry_count", 0)
+    count = int(previous) + 1 if isinstance(previous, (int, float)) and not isinstance(previous, bool) else 1
+    # Four doublings already exceed the 5s->60s cap; bound the exponent before
+    # constructing it so a corrupted local retry count cannot create a huge int.
+    exponent = min(max(0, count - 1), 4)
+    delay = min(
+        DELIVERY_RETRY_BASE_SECONDS * (2**exponent), DELIVERY_RETRY_MAX_SECONDS
+    )
+    return count, now + delay
+
+
+def _clear_delivery_retry(reconciliation: MutableMapping[str, Any]) -> None:
+    reconciliation.pop("retry_count", None)
+    reconciliation.pop("retry_after", None)
 
 
 def _condition_binding_summary(condition: Mapping[str, Any]) -> dict[str, Any]:
@@ -1927,7 +1980,10 @@ class MonitorService:
         self._recover_deferred_if_unlocked()
         now = self.observer_context_factory().now()
         self.ledger.expire_events(now=now)
-        for record in self.ledger.list(include_terminal=False):
+        records = sorted(
+            self.ledger.list(include_terminal=False), key=_reconcile_priority
+        )
+        for record in records:
             if record.state not in {
                 MonitorState.ARMED,
                 MonitorState.CLAIMED,
@@ -1936,6 +1992,8 @@ class MonitorService:
                 MonitorState.CANCEL_REQUESTED,
                 MonitorState.CANCELLATION_IN_PROGRESS,
             }:
+                continue
+            if not _delivery_retry_due(record, now):
                 continue
             try:
                 if (
@@ -2390,17 +2448,32 @@ class MonitorService:
                     "at": now,
                 }
             )
+            retry_count, retry_after = _next_delivery_retry(
+                record.reconciliation, now
+            )
+            offline["retry_count"] = retry_count
+            offline["retry_after"] = retry_after
             return self.ledger.update_thread_delivery(
                 record.monitor_id,
                 expected=(
                     MonitorState.ADMISSION_IN_PROGRESS,
                     MonitorState.QUEUE_ACCEPTED,
+                    MonitorState.CANCEL_REQUESTED,
+                    MonitorState.CANCELLATION_IN_PROGRESS,
                 ),
                 state=record.state,
                 delivery_state=(
                     ThreadDeliveryState.ADMISSION_IN_PROGRESS
                     if record.state == MonitorState.ADMISSION_IN_PROGRESS
-                    else ThreadDeliveryState.QUEUE_ACCEPTED
+                    else (
+                        ThreadDeliveryState.QUEUE_ACCEPTED
+                        if record.state == MonitorState.QUEUE_ACCEPTED
+                        else (
+                            ThreadDeliveryState.CANCEL_REQUESTED
+                            if record.state == MonitorState.CANCEL_REQUESTED
+                            else ThreadDeliveryState.CANCELLATION_IN_PROGRESS
+                        )
+                    )
                 ),
                 reconciliation=offline,
                 now=now,
@@ -2410,6 +2483,7 @@ class MonitorService:
         reconciliation = dict(record.reconciliation or {})
         reconciliation.update(dict(observation))
         reconciliation["at"] = now
+        _clear_delivery_retry(reconciliation)
         if record.state in {
             MonitorState.CANCEL_REQUESTED,
             MonitorState.CANCELLATION_IN_PROGRESS,
@@ -2469,6 +2543,11 @@ class MonitorService:
                     except AppServerError as exc:
                         reconciliation["deletion_result"] = "transport_uncertain"
                         reconciliation["deletion_error"] = str(exc)
+                        retry_count, retry_after = _next_delivery_retry(
+                            record.reconciliation, now
+                        )
+                        reconciliation["retry_count"] = retry_count
+                        reconciliation["retry_after"] = retry_after
                         return self.ledger.update_thread_delivery(
                             record.monitor_id,
                             expected=(MonitorState.CANCELLATION_IN_PROGRESS,),

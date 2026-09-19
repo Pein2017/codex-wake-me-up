@@ -139,6 +139,13 @@ task success or acceptance.
   25-second budget. Bounded synchronous identity capture has a final rowless
   deadline gate but is not an interruptible MCP wall-clock guarantee. Do not
   retry after a queue admission has begun.
+- Exact thread delivery performs a bounded target revalidation before queue
+  admission. A `preflight_transport_unavailable` result means the monitor is
+  still `claimed`/unattempted and no queue item was written; let the daemon
+  retry instead of re-arming or sending again. The daemon prioritizes fresh
+  claimed/in-progress work and may expose `retry_count`/`retry_after` while
+  backing off older admitted rows. Those fields describe reconciliation
+  timing, not delivery success, and no weaker condition is substituted.
 - Use one composed `all` monitor to wake after every worker settles. For
   continuing first-settlement control, arm independent single-leaf monitors;
   retain or cancel survivors explicitly. Typed `any` consumes losers.

@@ -54,6 +54,10 @@ def test_request_timeout_is_typed_as_transport_failure(tmp_path) -> None:
         asyncio.run(client._request("thread/read", {"threadId": "thread-1"}))
 
 
+def test_default_request_budget_covers_slow_thread_metadata_reads() -> None:
+    assert AppServerClient().timeout_seconds == 15.0
+
+
 def test_unknown_core_method_is_sanitized_and_typed(tmp_path) -> None:
     class RejectedWebsocket:
         async def send_json(self, _payload) -> None:

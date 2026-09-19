@@ -145,6 +145,16 @@ most one retry for a typed read-only local transport failure before any ledger
 row or queue admission; it never reuses this rule after a durable delivery
 attempt.
 
+After an exact thread monitor fires, delivery revalidates the target with a
+finite app-server budget (currently 15 seconds). If that read times out,
+status reports `preflight_transport_unavailable` while the monitor remains
+`claimed` and unattempted; no queue item was written and no weaker condition is
+used. The daemon gives claimed and in-progress deliveries priority over old
+`queue_accepted` reconciliation, and persists bounded `retry_count`/
+`retry_after` backoff for temporary transport failures. These are scheduling
+facts, not evidence that the lead has read or accepted the notification; do not
+re-arm or resend an unresolved monitor.
+
 The MCP request timeout is only a control-call bound. Once registration returns
 an `armed` durable receipt, the detached daemon owns observation and delivery
 until the condition, expiry, cancellation, or a typed failure terminates it.

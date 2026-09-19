@@ -70,7 +70,7 @@ class AppServerClient:
         self,
         codex_home: str | Path | None = None,
         *,
-        timeout_seconds: float = 10.0,
+        timeout_seconds: float = 15.0,
         experimental_api: bool = False,
     ):
         self.codex_home = resolve_codex_home(codex_home)

@@ -90,6 +90,7 @@ class FakeThreadDelivery:
         self.queue = list(queue or [])
         self.preflight_calls: list[str] = []
         self.add_calls: list[dict] = []
+        self.operations: list[tuple[str, str]] = []
         self.resume_calls: list[str] = []
         self.delete_calls: list[tuple[str, str]] = []
 
@@ -101,6 +102,7 @@ class FakeThreadDelivery:
 
     async def preflight_thread_delivery(self, thread_id: str) -> dict:
         self.preflight_calls.append(thread_id)
+        self.operations.append(("preflight", thread_id))
         return {
             "thread_id": thread_id,
             "runtime_status": "idle" if self.loaded else "notLoaded",
@@ -128,6 +130,7 @@ class FakeThreadDelivery:
 
     async def add_thread_delivery(self, **request) -> dict:
         self.add_calls.append(dict(request))
+        self.operations.append(("add", request["delivery_id"]))
         if isinstance(self.add_result, Exception):
             raise self.add_result
         return {
@@ -136,7 +139,8 @@ class FakeThreadDelivery:
             "pointer": request["pointer"],
         }
 
-    async def inspect_thread_delivery(self, **_request) -> dict:
+    async def inspect_thread_delivery(self, **request) -> dict:
+        self.operations.append(("inspect", request["delivery_id"]))
         if self.inspections:
             inspection = self.inspections.pop(0)
             if isinstance(inspection, Exception):
@@ -1601,6 +1605,81 @@ def test_claimed_delivery_can_be_cancelled_before_preflight_retry(tmp_path) -> N
     assert cancelled["state"] == MonitorState.CANCELLED
     assert service.status(registered["monitor_id"])["state"] == MonitorState.CANCELLED
     assert adapter.add_calls == []
+
+
+def test_claimed_delivery_is_processed_before_old_queue_reconciliation(tmp_path) -> None:
+    clock = Clock()
+    adapter = FakeThreadDelivery()
+    service = _thread_service(tmp_path, adapter, clock)
+    old = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="old-queue-row",
+            start_daemon=False,
+        )
+    )
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    assert service.status(old["monitor_id"])["state"] == MonitorState.QUEUE_ACCEPTED
+
+    fresh = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="fresh-claimed-row",
+            start_daemon=False,
+        )
+    )
+    adapter.operations.clear()
+    clock.value = 104.0
+    asyncio.run(service.reconcile_once())
+
+    fresh_delivery_id = fresh["delivery"]["delivery_id"]
+    old_delivery_id = old["delivery"]["delivery_id"]
+    assert ("add", fresh_delivery_id) in adapter.operations
+    assert ("inspect", old_delivery_id) in adapter.operations
+    assert adapter.operations.index(("add", fresh_delivery_id)) < adapter.operations.index(
+        ("inspect", old_delivery_id)
+    )
+
+
+def test_offline_reconciliation_persists_and_honors_bounded_backoff(tmp_path) -> None:
+    clock = Clock()
+    adapter = FakeThreadDelivery(
+        inspections=[AppServerTransportError("app-server thread/read timed out")]
+    )
+    service = _thread_service(tmp_path, adapter, clock)
+    registered = asyncio.run(
+        service.wait_for_event(
+            thread_id="thread-1",
+            condition={"type": "time", "after_seconds": 1},
+            expires_in_seconds=100,
+            idempotency_key="offline-backoff",
+            start_daemon=False,
+        )
+    )
+    clock.value = 102.0
+    asyncio.run(service.reconcile_once())
+    first = service.status(registered["monitor_id"])
+    retry_after = first["reconciliation"]["retry_after"]
+    assert first["state"] == MonitorState.QUEUE_ACCEPTED
+    assert first["reconciliation"]["retry_count"] == 1
+    assert retry_after == 107.0
+
+    adapter.operations.clear()
+    clock.value = 106.0
+    asyncio.run(service.reconcile_once())
+    assert ("inspect", registered["delivery"]["delivery_id"]) not in adapter.operations
+
+    clock.value = retry_after
+    asyncio.run(service.reconcile_once())
+    assert ("inspect", registered["delivery"]["delivery_id"]) in adapter.operations
+    recovered = service.status(registered["monitor_id"])
+    assert "retry_after" not in recovered["reconciliation"]
+    assert "retry_count" not in recovered["reconciliation"]
 
 
 def test_queue_accepted_monitor_can_parent_fresh_lineage_without_readd(
